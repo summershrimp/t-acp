@@ -10,7 +10,12 @@ pub struct AdapterObservation {
     pub status: InstanceStatus,
     pub ui_mode: UiMode,
     pub blocking_reason: Option<String>,
+    pub current_agent: Option<String>,
     pub current_model: Option<String>,
+    pub current_provider: Option<String>,
+    pub current_reasoning_effort: Option<String>,
+    pub current_context_window: Option<String>,
+    pub current_context_usage_percent: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,7 +162,12 @@ fn starting_observation() -> AdapterObservation {
         status: InstanceStatus::Starting,
         ui_mode: UiMode::Unknown,
         blocking_reason: None,
+        current_agent: None,
         current_model: None,
+        current_provider: None,
+        current_reasoning_effort: None,
+        current_context_window: None,
+        current_context_usage_percent: None,
     }
 }
 
@@ -170,7 +180,12 @@ fn observe_generic(output_tail: &[u8]) -> AdapterObservation {
         status: InstanceStatus::Ready,
         ui_mode: UiMode::Normal,
         blocking_reason: None,
+        current_agent: None,
         current_model: None,
+        current_provider: None,
+        current_reasoning_effort: None,
+        current_context_window: None,
+        current_context_usage_percent: None,
     }
 }
 

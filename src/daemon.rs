@@ -34,7 +34,12 @@ struct AgentInstance {
     status: String,
     ui_mode: String,
     blocking_reason: Option<String>,
+    current_agent: Option<String>,
     current_model: Option<String>,
+    current_provider: Option<String>,
+    current_reasoning_effort: Option<String>,
+    current_context_window: Option<String>,
+    current_context_usage_percent: Option<u8>,
     exit_status: Option<String>,
     screen: vt100::Parser,
     screen_tail: String,
@@ -195,7 +200,12 @@ async fn register_agent(
         status: observation.status.as_str().to_string(),
         ui_mode: observation.ui_mode.as_str().to_string(),
         blocking_reason: observation.blocking_reason,
+        current_agent: observation.current_agent,
         current_model: observation.current_model,
+        current_provider: observation.current_provider,
+        current_reasoning_effort: observation.current_reasoning_effort,
+        current_context_window: observation.current_context_window,
+        current_context_usage_percent: observation.current_context_usage_percent,
         exit_status: None,
         screen: vt100::Parser::new(24, 80, 2000),
         screen_tail: String::new(),
@@ -226,11 +236,17 @@ async fn append_output(
         .ok_or(ApiError::NotFound)?;
 
     instance.screen.process(&body);
-    instance.screen_tail = instance.screen.screen().contents();
+    instance.screen_tail = render_screen_tail(&instance.screen);
     apply_observation(instance);
     instance.updated_at_ms = now_millis();
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn render_screen_tail(parser: &vt100::Parser) -> String {
+    let screen = parser.screen();
+    let (_, cols) = screen.size();
+    screen.rows(0, cols).collect::<Vec<_>>().join("\n")
 }
 
 async fn mark_exited(
@@ -342,7 +358,12 @@ fn apply_observation(instance: &mut AgentInstance) {
     instance.status = observation.status.as_str().to_string();
     instance.ui_mode = observation.ui_mode.as_str().to_string();
     instance.blocking_reason = observation.blocking_reason;
+    instance.current_agent = observation.current_agent;
     instance.current_model = observation.current_model;
+    instance.current_provider = observation.current_provider;
+    instance.current_reasoning_effort = observation.current_reasoning_effort;
+    instance.current_context_window = observation.current_context_window;
+    instance.current_context_usage_percent = observation.current_context_usage_percent;
 }
 
 impl AgentInstance {
@@ -357,7 +378,12 @@ impl AgentInstance {
             status: self.status.clone(),
             ui_mode: self.ui_mode.clone(),
             blocking_reason: self.blocking_reason.clone(),
+            current_agent: self.current_agent.clone(),
             current_model: self.current_model.clone(),
+            current_provider: self.current_provider.clone(),
+            current_reasoning_effort: self.current_reasoning_effort.clone(),
+            current_context_window: self.current_context_window.clone(),
+            current_context_usage_percent: self.current_context_usage_percent,
             exit_status: self.exit_status.clone(),
             created_at_ms: self.created_at_ms,
             updated_at_ms: self.updated_at_ms,

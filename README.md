@@ -244,7 +244,12 @@ curl -X DELETE \
   "status": "ready",
   "ui_mode": "input",
   "blocking_reason": null,
-  "current_model": null,
+  "current_agent": "Build",
+  "current_model": "GPT-5.4",
+  "current_provider": "GitHub Copilot",
+  "current_reasoning_effort": "high",
+  "current_context_window": "42.6K",
+  "current_context_usage_percent": 21,
   "exit_status": null,
   "created_at_ms": 1716620000000,
   "updated_at_ms": 1716620001234,
@@ -257,6 +262,12 @@ curl -X DELETE \
 - `status`: `starting`、`ready`、`busy`、`blocked`、`exited`
 - `ui_mode`: `unknown`、`normal`、`input`、`permission_prompt`、`model_picker`
 - `blocking_reason`: 当前仅在识别到权限阻塞时可能为 `permission`
+- `current_agent`: 当前输入框底部状态条里的 agent 名，例如 `Build`
+- `current_model`: 当前模型名；对 `opencode` 会优先解析底部状态条，回退到类似 `Model: ...` 的文本
+- `current_provider`: 当前 provider 名，例如 `GitHub Copilot`
+- `current_reasoning_effort`: 当前思考强度，例如 `high`
+- `current_context_window`: 右下角显示的当前上下文长度，例如 `42.6K`
+- `current_context_usage_percent`: 右下角显示的上下文占用百分比，例如 `21`
 - `screen_tail`: daemon 维护的最近终端屏幕文本，用于状态观察和适配器判断
 
 ## 适配器说明
@@ -268,7 +279,9 @@ curl -X DELETE \
 - 识别权限弹窗
 - 粗略识别 model picker
 - 根据屏幕文本推断 `starting` / `ready` / `busy` / `blocked`
-- 从屏幕中提取类似 `Model: ...` 的模型信息
+- 从输入框底部状态条提取 agent / model / provider / thinking effort
+- 从右下角状态区提取 context length / context usage percent
+- 回退提取类似 `Model: ...` 的模型信息
 
 ### generic
 
