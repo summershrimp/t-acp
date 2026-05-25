@@ -1,94 +1,114 @@
 # t-acp
 
-`t-acp` 是一个 Rust 编写的本地控制层：它把终端里的 TUI agent 包在前台运行，同时暴露一个本地 HTTP API，用来查看实例状态、读取最近屏幕内容，并向 agent 注入输入或适配器动作。
+[中文](./README.zh.md)
 
-当前它最适合这样的场景：
+`t-acp` is a local control layer for terminal-based TUI agents.
 
-- 你仍然希望直接在当前终端里使用 `opencode`、`claude-code`、`codex` 等 TUI agent。
-- 你还希望从另一个本地进程或脚本里观测它们的状态。
-- 你需要一个简单的本地 RPC 接口来发送提示词、处理权限弹窗或终止会话。
+It lets you keep using interactive agents like `opencode`, `claude-code`, and `codex` directly in your current terminal, while also exposing a local HTTP API for scripts, automation, or other local processes to inspect status, read recent screen contents, send input, and trigger adapter actions.
 
-## 特性
+## Overview
 
-- 前台运行 agent，保留原始 TUI 交互体验。
-- 自动启动本地 daemon，并把实例注册到内存注册表。
-- 通过 PTY 转发标准输入、标准输出和窗口大小变化。
-- 提供本地 HTTP API：列出实例、查看详情、发送输入、执行动作、终止实例。
-- 对 `opencode` 提供额外适配能力：
-  - 检测权限确认界面
-  - `send-prompt` 使用 bracketed paste 注入多行提示
-  - 支持批准 / 拒绝权限弹窗
-- 对其他 agent 提供通用适配器回退。
+`t-acp` is useful when:
 
-## 项目结构
+- You want to keep the native TUI experience instead of converting an agent into a pure API workflow.
+- You want another local process to observe whether the agent is busy, blocked on a permission prompt, or running on a specific model.
+- You want a simple local interface to send prompts, approve permission dialogs, cycle models, or terminate an instance.
 
-```text
-src/main.rs      CLI 入口
-src/wrapper.rs   前台包装、daemon 自启动、PTY 与 RPC 转发
-src/daemon.rs    本地 HTTP 控制服务与实例注册表
- src/adapters/    adapter trait 与具体实现，当前重点支持 opencode
-src/pty.rs       Unix PTY 启动与 resize
-src/http.rs      daemon 客户端
-src/api.rs       HTTP 请求 / 响应结构
-src/util.rs      小型辅助函数
-plans/           设计与实现计划
-```
+Its goal is not remote session hosting. It combines an interactive foreground terminal session with a programmable local control surface on the same machine.
 
-## 依赖与环境
+## What It Does
+
+- Runs the agent in the foreground and preserves the original PTY/TUI interaction model.
+- Ensures the local daemon is available and registers new instances automatically.
+- Exposes a local HTTP API to list instances, inspect details, send input, run actions, and terminate instances.
+- Maintains a recent terminal screen snapshot in `screen_tail` for external observation.
+- Exposes runtime metadata such as current agent, model, provider, reasoning effort, context usage, and terminal focus state.
+- Provides specialized adapter behavior for `opencode`, including permission prompt detection, prompt injection, and model cycling shortcuts.
+- Falls back to a generic adapter for `claude-code`, `codex`, and unknown commands.
+
+## Current Support
+
+### `opencode`
+
+- Detects permission prompts
+- Uses bracketed paste for `send-prompt` and submits automatically
+- Supports `approve-permission` / `reject-permission`
+- Supports `previous-model` / `next-model`
+- Attempts to extract runtime metadata: agent, model, provider, reasoning effort, and context usage
+
+### Generic adapter
+
+The following currently use the `generic` adapter:
+
+- `claude-code`
+- `codex`
+- Any command without a dedicated adapter
+
+The generic adapter supports:
+
+- Instance registration
+- Raw input injection
+- `send-prompt`
+
+The generic adapter does not currently provide reliable permission prompt detection or model switching behavior.
+
+## Requirements
 
 - Rust 2024 edition
 - Cargo
-- 本机可执行的终端 agent，例如 `opencode`
+- A terminal agent executable available on the local machine, such as `opencode`
 
-默认监听地址：`127.0.0.1:48974`
+Default listen address: `127.0.0.1:48974`
 
-可以通过环境变量覆盖：
+You can override it with an environment variable:
 
 ```bash
 export T_ACP_ADDR=127.0.0.1:49001
 ```
 
-日志过滤使用 `RUST_LOG` 控制，例如：
+Use `RUST_LOG` to control logging, for example:
 
 ```bash
 RUST_LOG=info cargo run -- daemon
 ```
 
-## 构建
+## Build
 
 ```bash
 cargo build
 ```
 
-## 用法
+## Quick Start
 
-### 1. 启动 daemon
+### 1. Start the daemon
 
-手动启动：
+Start it manually:
 
 ```bash
 cargo run -- daemon
 ```
 
-指定地址：
+With an explicit address:
 
 ```bash
 cargo run -- daemon --addr 127.0.0.1:49001
 ```
 
-### 2. 通过 wrapper 启动 agent
+In many cases you do not need to start it manually. When you launch an agent through the wrapper, `t-acp` checks the daemon first and starts it in the background if needed.
+
+### 2. Start an agent through the wrapper
 
 ```bash
 cargo run -- opencode
 ```
 
-传递额外参数：
+Pass additional arguments through:
 
 ```bash
 cargo run -- opencode --model gpt-5
 ```
 
-也可以包装其他命令：
+You can also wrap other commands:
 
 ```bash
 cargo run -- claude-code
@@ -96,29 +116,29 @@ cargo run -- codex
 cargo run -- /path/to/custom-agent
 ```
 
-当你以 `t-acp <agent> ...` 方式运行时：
+When you run `t-acp <agent> ...`:
 
-1. wrapper 会检查 daemon 是否健康。
-2. 如果 daemon 未启动，会自动在后台拉起一个。
-3. agent 会在 PTY 中以前台方式运行。
-4. 屏幕输出会继续显示在当前终端，同时同步给 daemon。
-5. daemon 会记录实例元信息、状态和最近屏幕内容。
+1. The wrapper checks whether the daemon is healthy.
+2. If the daemon is not running, it starts one in the background.
+3. The agent runs in a PTY in the foreground.
+4. Screen output remains visible in your terminal and is also forwarded to the daemon.
+5. The daemon records instance metadata, status, recent screen contents, and any runtime metadata it can infer.
 
-## 快速示例
+## Common Usage
 
-启动 agent：
+Start an agent:
 
 ```bash
 cargo run -- opencode
 ```
 
-查看实例列表：
+List instances:
 
 ```bash
 curl http://127.0.0.1:48974/agents
 ```
 
-向某个实例发送原始输入：
+Send raw input to an instance:
 
 ```bash
 curl -X POST \
@@ -126,7 +146,7 @@ curl -X POST \
   http://127.0.0.1:48974/agents/<instance_id>/input
 ```
 
-通过适配器发送 prompt：
+Send a prompt through the adapter:
 
 ```bash
 curl -X POST \
@@ -134,31 +154,38 @@ curl -X POST \
   http://127.0.0.1:48974/agents/<instance_id>/actions/send-prompt
 ```
 
-如果 `opencode` 出现权限确认界面，批准该操作：
+Approve an `opencode` permission prompt:
 
 ```bash
 curl -X POST \
   http://127.0.0.1:48974/agents/<instance_id>/actions/approve-permission
 ```
 
-终止实例：
+Cycle to the next model:
+
+```bash
+curl -X POST \
+  http://127.0.0.1:48974/agents/<instance_id>/actions/next-model
+```
+
+Terminate an instance:
 
 ```bash
 curl -X DELETE \
   http://127.0.0.1:48974/agents/<instance_id>
 ```
 
-## HTTP API
+## Public API
 
-所有接口默认监听在 `http://127.0.0.1:48974`。
+All endpoints listen on `http://127.0.0.1:48974` by default.
 
-### 对外接口
+### Read endpoints
 
 #### `GET /health`
 
-健康检查。
+Health check.
 
-响应示例：
+Example response:
 
 ```json
 {
@@ -168,85 +195,96 @@ curl -X DELETE \
 
 #### `GET /agents`
 
-列出当前注册的 agent 实例。
+Lists registered instances.
+
+Example response:
+
+```json
+{
+  "agents": []
+}
+```
 
 #### `GET /agents/{instance_id}`
 
-查看单个实例详情。
+Returns details for a single instance.
+
+### Write endpoints
+
+Every public write endpoint except `GET /health`, `GET /agents`, and `GET /agents/{instance_id}` returns `202 Accepted` on success:
+
+```json
+{
+  "queued": true,
+  "adapter": "opencode"
+}
+```
+
+Notes:
+
+- `queued: true` means the command has been queued or sent through the internal runtime channel
+- `adapter` indicates which adapter produced the action
+- Raw `input` and `DELETE /agents/{instance_id}` are not adapter-generated actions, so they return `"adapter": null`
 
 #### `POST /agents/{instance_id}/input`
 
-向实例注入原始字节输入。请求体直接作为 PTY 输入写入，不要求 JSON。
+Injects raw bytes into the instance PTY. The request body is written directly and does not need to be JSON.
 
-适合发送：
+Useful for:
 
-- 普通文本
+- Regular text
 - `\n` / `\r`
-- 控制字符，例如 `Ctrl+C` 对应 `0x03`
+- Control characters, for example `Ctrl+C` as `0x03`
 
 #### `POST /agents/{instance_id}/actions/send-prompt`
 
-发送“提示词”动作。
+Sends a prompt action.
 
-- 对 `opencode`：使用 bracketed paste 包裹请求体，并自动回车提交。
-- 对 generic adapter：如果请求体末尾没有换行，会自动补一个换行。
+- For `opencode`: wraps the body in bracketed paste and submits it automatically
+- For the generic adapter: appends a newline if the body does not already end with one
 
 #### `POST /agents/{instance_id}/actions/approve-permission`
 
-批准权限请求。
+Approves a permission request.
 
-- 对 `opencode`：只有检测到权限弹窗时才会排队执行。
-- 当前实现发送回车确认。
+- For `opencode`: only succeeds when a permission prompt is currently visible
+- The current implementation sends Enter
 
 #### `POST /agents/{instance_id}/actions/reject-permission`
 
-拒绝权限请求。
+Rejects a permission request.
 
-- 对 `opencode`：只有检测到权限弹窗时才会排队执行。
-- 当前实现发送 `Esc`。
+- For `opencode`: only succeeds when a permission prompt is currently visible
+- The current implementation sends `Esc`
 
 #### `POST /agents/{instance_id}/actions/previous-model`
 
-切换到上一个模型。
+Cycles to the previous model.
 
-- 对 `opencode`：发送 `Shift+F2`
-- generic adapter 当前返回 `501 unsupported_action`
+- For `opencode`: sends `Shift+F2`
+- The generic adapter currently returns `501 unsupported_action`
 
 #### `POST /agents/{instance_id}/actions/next-model`
 
-切换到下一个模型。
+Cycles to the next model.
 
-- 对 `opencode`：发送 `F2`
-- generic adapter 当前返回 `501 unsupported_action`
+- For `opencode`: sends `F2`
+- The generic adapter currently returns `501 unsupported_action`
 
 #### `POST /agents/{instance_id}/actions/switch-model`
 
-预留接口。
+Reserved endpoint. The request body may eventually carry a target model identifier.
 
-- `opencode` 当前返回 `501 unsupported_action`
-- generic adapter 也尚未实现
+- `opencode` currently returns `501 unsupported_action`
+- The generic adapter is also not implemented yet
 
 #### `DELETE /agents/{instance_id}`
 
-向实例发送 `Ctrl+C`，用于请求终止当前前台 agent。
+Sends `Ctrl+C` to request termination of the foreground agent.
 
-### 内部接口
+## Instance Object
 
-以下接口主要由 wrapper 与 daemon 自身使用，不建议外部调用：
-
-- `POST /internal/agents/register`
-- `GET /internal/agents/{instance_id}/ws`
-- `POST /internal/agents/{instance_id}/exit`
-
-当前 wrapper 与 daemon 之间通过 `/internal/agents/{instance_id}/ws` 传输：
-
-- wrapper 通过 WebSocket 上报 PTY output
-- wrapper 通过 WebSocket 上报 resize、focus 等内部运行时事件
-- daemon 通过同一条 WebSocket 下发待执行命令
-
-## 数据模型
-
-`GET /agents` 与 `GET /agents/{instance_id}` 返回的实例对象形如：
+The objects returned by `GET /agents` and `GET /agents/{instance_id}` look like this:
 
 ```json
 {
@@ -273,67 +311,77 @@ curl -X DELETE \
 }
 ```
 
-字段说明：
+Key fields:
 
-- `status`: `starting`、`ready`、`busy`、`blocked`、`exited`
-- `ui_mode`: `unknown`、`normal`、`input`、`permission_prompt`、`model_picker`
-- `blocking_reason`: 当前仅在识别到权限阻塞时可能为 `permission`
-- `current_agent`: 当前输入框底部状态条里的 agent 名，例如 `Build`
-- `current_model`: 当前模型名；对 `opencode` 会优先解析底部状态条，回退到类似 `Model: ...` 的文本
-- `current_provider`: 当前 provider 名，例如 `GitHub Copilot`
-- `current_reasoning_effort`: 当前思考强度，例如 `high`
-- `current_context_window`: 右下角显示的当前上下文长度，例如 `42.6K`
-- `current_context_usage_percent`: 右下角显示的上下文占用百分比，例如 `21`
-- `focused`: 外层终端当前是否处于 focus 状态
-- `screen_tail`: daemon 维护的最近终端屏幕文本，用于状态观察和适配器判断
+- `agent_kind`: normalized instance type such as `opencode`, `claude_code`, or `codex`
+- `adapter`: the adapter actually in use; today only `opencode` has a dedicated adapter, while most others return `generic`
+- `status`: `starting`, `ready`, `busy`, `blocked`, `exited`
+- `ui_mode`: `unknown`, `normal`, `input`, `permission_prompt`, `model_picker`
+- `blocking_reason`: currently only `permission` when a permission block is detected
+- `current_agent`: agent name parsed from the runtime footer, such as `Build`
+- `current_model`: current model name
+- `current_provider`: current provider name, such as `GitHub Copilot`
+- `current_reasoning_effort`: current reasoning level, such as `high`
+- `current_context_window`: current context size, such as `42.6K`
+- `current_context_usage_percent`: current context usage percentage, such as `21`
+- `focused`: whether the outer terminal is currently focused
+- `screen_tail`: recent terminal screen text maintained by the daemon for observation and adapter heuristics
 
-如果在 `tmux` 里使用时发现 `focused` 状态不准确，需要启用 `tmux` 的 focus 事件转发：`set -g focus-events on`。
+## Focus State
 
-## 适配器说明
+`focused` depends on terminal focus reporting support.
 
-### opencode
+The wrapper tries to enable it automatically. If the terminal or multiplexer does not support it, `focused` may remain at its default value.
 
-当前为 `opencode` 提供了更具体的运行时识别逻辑：
+If you are running inside `tmux`, enable:
 
-- 识别权限弹窗
-- 粗略识别 model picker
-- 根据屏幕文本推断 `starting` / `ready` / `busy` / `blocked`
-- 从输入框底部状态条提取 agent / model / provider / thinking effort
-- 从右下角状态区提取 context length / context usage percent
-- 回退提取类似 `Model: ...` 的模型信息
+```tmux
+set -g focus-events on
+```
 
-### generic
+## Error Semantics
 
-除 `opencode` 以外的命令默认使用 `generic` 适配器：
+Common errors include:
 
-- 可以注册实例
-- 可以发送原始输入
-- 可以使用 `send-prompt`
-- 不提供可靠的权限界面识别和 model 切换能力
+- `404 not_found`: the instance does not exist
+- `409 process_exited`: the instance has already exited and can no longer accept actions
+- `409 ui_not_detected`: the adapter requires a UI state that is not currently visible, for example no permission prompt is present
+- `400 bad_request`: the request body is invalid, such as an empty prompt
+- `501 unsupported_action`: the current adapter does not support that action yet
 
-## 开发与测试
+## Current Limitations
 
-格式化：
+- The daemon registry is in-memory only, so instance data is not persisted across daemon restarts
+- `screen_tail` is based on terminal screen contents, not a complete output log
+- `switch-model` is not implemented yet
+- A remote `resize` API is not wired yet
+- `focused` depends on proper focus event forwarding from the terminal and any multiplexer such as `tmux`
+- Adapter state detection is heuristic; `opencode` UI detection can still misclassify some screens
+- The service listens on loopback by default and has no authentication; do not expose it directly to the public internet
+
+## Development And Testing
+
+Formatting:
 
 ```bash
 cargo fmt
 cargo fmt --check
 ```
 
-运行测试：
+Run tests:
 
 ```bash
 cargo test
 ```
 
-手动 smoke test：
+Manual smoke test:
 
 ```bash
 target/debug/t-acp daemon --addr 127.0.0.1:49001
 T_ACP_ADDR=127.0.0.1:49001 target/debug/t-acp /bin/cat
 ```
 
-在另一个终端里发送输入：
+Then send input from another terminal:
 
 ```bash
 curl -X POST \
@@ -341,19 +389,35 @@ curl -X POST \
   http://127.0.0.1:49001/agents/<instance_id>/input
 ```
 
-## 当前限制
+## Project Structure
 
-- daemon 注册表是内存态的，重启后实例信息不会持久化。
-- `screen_tail` 基于终端屏幕内容，不是完整日志流。
-- `switch-model` 还未实现。
-- 远程 `resize` API 还未接线。
-- 适配器状态识别目前以启发式文本判断为主，尤其是 `opencode` 的 UI 检测仍然可能误判。
-- 服务默认只监听本地回环地址，没有认证机制，不应直接暴露到公网。
+```text
+src/main.rs              CLI entry point
+src/wrapper.rs           foreground wrapper, daemon bootstrap, PTY and RPC forwarding
+src/daemon.rs            local HTTP control service and instance registry
+src/adapters/            adapter trait and implementations
+src/adapters/generic.rs  generic adapter
+src/adapters/opencode.rs opencode adapter and metadata extraction
+src/pty.rs               Unix PTY spawn and resize support
+src/http.rs              daemon client
+src/api.rs               HTTP request and response structures
+src/internal.rs          internal WebSocket messages between wrapper and daemon
+src/util.rs              small utility helpers
+plans/                   design and implementation notes
+```
 
-## 后续可扩展方向
+## Internal Runtime Notes
 
-- 增加更多 agent 的专用适配器
-- 为实例增加持久化和历史记录
-- 提供更稳定的事件流接口
-- 完善 model 切换和远程 resize
-- 补充更多端到端 smoke tests
+The following endpoints are primarily for internal wrapper-daemon communication and are not intended for external callers:
+
+- `POST /internal/agents/register`
+- `GET /internal/agents/{instance_id}/ws` for WebSocket upgrade
+- `POST /internal/agents/{instance_id}/exit`
+
+The wrapper and daemon currently use `/internal/agents/{instance_id}/ws` to carry:
+
+- PTY output from the wrapper to the daemon
+- Resize and focus runtime events from the wrapper to the daemon
+- Queued commands from the daemon back to the wrapper
+
+In other words, the runtime data plane now goes through the internal WebSocket. Internal HTTP is mainly used for registration and exit reporting.
