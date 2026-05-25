@@ -33,6 +33,8 @@ Use standard Rust formatting via `rustfmt`; keep code `cargo fmt --check` clean.
 
 Keep public behavior instance-centric in API naming: routes should target `/agents/:instance_id/...`, while `session` remains an internal runtime concept.
 
+All wrapper-to-daemon internal runtime traffic must flow through the internal WebSocket channel at `/internal/agents/:instance_id/ws`. Do not add new internal HTTP endpoints for output, resize, command delivery, or similar runtime events unless there is a very specific compatibility need.
+
 ## Testing Guidelines
 
 Add unit tests near the code they cover. Name tests by behavior, for example `opencode_detects_permission_prompt` or `form_round_trip_handles_spaces_and_symbols`.

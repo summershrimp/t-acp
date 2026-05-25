@@ -226,10 +226,6 @@ curl -X DELETE \
 - `opencode` 当前返回 `501 unsupported_action`
 - generic adapter 也尚未实现
 
-#### `POST /agents/{instance_id}/resize`
-
-预留接口，当前未接线，返回 `501 unsupported_action`。
-
 #### `DELETE /agents/{instance_id}`
 
 向实例发送 `Ctrl+C`，用于请求终止当前前台 agent。
@@ -239,9 +235,14 @@ curl -X DELETE \
 以下接口主要由 wrapper 与 daemon 自身使用，不建议外部调用：
 
 - `POST /internal/agents/register`
-- `POST /internal/agents/{instance_id}/output`
+- `GET /internal/agents/{instance_id}/ws`
 - `POST /internal/agents/{instance_id}/exit`
-- `GET /internal/agents/{instance_id}/commands`
+
+当前 wrapper 与 daemon 之间通过 `/internal/agents/{instance_id}/ws` 传输：
+
+- wrapper 通过 WebSocket 上报 PTY output
+- wrapper 通过 WebSocket 上报 resize 等内部运行时事件
+- daemon 通过同一条 WebSocket 下发待执行命令
 
 ## 数据模型
 

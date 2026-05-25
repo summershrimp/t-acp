@@ -3,18 +3,23 @@ use crate::api::{
     ActionQueued, AgentList, AgentView, ErrorBody, ExitRequest, HealthResponse,
     RegisterAgentRequest,
 };
+use crate::internal::{InternalWsClientMessage, InternalWsServerMessage};
 use crate::util::now_millis;
 use anyhow::{Context, Result};
 use axum::body::Bytes;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
+use futures_util::stream::SplitSink;
+use futures_util::{SinkExt, StreamExt};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
+use tokio::sync::mpsc;
 use tracing::info;
 
 type SharedRegistry = Arc<Mutex<Registry>>;
@@ -44,6 +49,7 @@ struct AgentInstance {
     screen: vt100::Parser,
     screen_tail: String,
     command_queue: VecDeque<Vec<u8>>,
+    ws_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     created_at_ms: u128,
     updated_at_ms: u128,
 }
@@ -79,11 +85,9 @@ pub async fn run(addr: &str) -> Result<()> {
             "/agents/{instance_id}/actions/switch-model",
             post(action_switch_model),
         )
-        .route("/agents/{instance_id}/resize", post(remote_resize))
         .route("/internal/agents/register", post(register_agent))
-        .route("/internal/agents/{instance_id}/output", post(append_output))
+        .route("/internal/agents/{instance_id}/ws", any(connect_agent_ws))
         .route("/internal/agents/{instance_id}/exit", post(mark_exited))
-        .route("/internal/agents/{instance_id}/commands", get(pop_command))
         .with_state(registry);
 
     let addr = addr
@@ -195,12 +199,6 @@ async fn action_switch_model(
     })
 }
 
-async fn remote_resize() -> Result<Json<ErrorBody>, ApiError> {
-    Err(ApiError::UnsupportedAction(
-        "remote resize is not wired yet".to_string(),
-    ))
-}
-
 async fn delete_agent(
     State(registry): State<SharedRegistry>,
     Path(instance_id): Path<String>,
@@ -233,9 +231,10 @@ async fn register_agent(
         current_context_window: observation.current_context_window,
         current_context_usage_percent: observation.current_context_usage_percent,
         exit_status: None,
-        screen: vt100::Parser::new(24, 80, 2000),
+        screen: vt100::Parser::new(request.rows, request.cols, 2000),
         screen_tail: String::new(),
         command_queue: VecDeque::new(),
+        ws_tx: None,
         created_at_ms: now,
         updated_at_ms: now,
     };
@@ -250,23 +249,24 @@ async fn register_agent(
     Ok((StatusCode::CREATED, Json(view)))
 }
 
-async fn append_output(
+async fn connect_agent_ws(
+    ws: WebSocketUpgrade,
     State(registry): State<SharedRegistry>,
     Path(instance_id): Path<String>,
-    body: Bytes,
-) -> Result<StatusCode, ApiError> {
-    let mut registry = registry.lock().expect("registry lock poisoned");
-    let instance = registry
-        .instances
-        .get_mut(&instance_id)
-        .ok_or(ApiError::NotFound)?;
+) -> Result<Response, ApiError> {
+    {
+        let registry = registry.lock().expect("registry lock poisoned");
+        let instance = registry
+            .instances
+            .get(&instance_id)
+            .ok_or(ApiError::NotFound)?;
 
-    instance.screen.process(&body);
-    instance.screen_tail = render_screen_tail(&instance.screen);
-    apply_observation(instance);
-    instance.updated_at_ms = now_millis();
+        if instance.status == "exited" {
+            return Err(ApiError::ProcessExited);
+        }
+    }
 
-    Ok(StatusCode::NO_CONTENT)
+    Ok(ws.on_upgrade(move |socket| handle_agent_ws(registry, instance_id, socket)))
 }
 
 fn render_screen_tail(parser: &vt100::Parser) -> String {
@@ -295,26 +295,103 @@ async fn mark_exited(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn pop_command(
-    State(registry): State<SharedRegistry>,
-    Path(instance_id): Path<String>,
-) -> Result<Response, ApiError> {
-    let mut registry = registry.lock().expect("registry lock poisoned");
-    let instance = registry
-        .instances
-        .get_mut(&instance_id)
-        .ok_or(ApiError::NotFound)?;
+async fn handle_agent_ws(registry: SharedRegistry, instance_id: String, socket: WebSocket) {
+    let (mut sender, mut receiver) = socket.split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-    if let Some(command) = instance.command_queue.pop_front() {
-        instance.updated_at_ms = now_millis();
-        Ok((
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/octet-stream")],
-            command,
-        )
-            .into_response())
-    } else {
-        Ok(StatusCode::NO_CONTENT.into_response())
+    {
+        let mut registry = registry.lock().expect("registry lock poisoned");
+        let Some(instance) = registry.instances.get_mut(&instance_id) else {
+            return;
+        };
+        instance.ws_tx = Some(tx);
+
+        while let Some(command) = instance.command_queue.pop_front() {
+            if let Some(ws_tx) = &instance.ws_tx {
+                if ws_tx.send(command).is_err() {
+                    instance.ws_tx = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    let send_task = tokio::spawn(async move { send_ws_commands(&mut sender, &mut rx).await });
+
+    while let Some(message) = receiver.next().await {
+        let Ok(message) = message else {
+            break;
+        };
+
+        match message {
+            Message::Text(text) => {
+                if let Ok(frame) = serde_json::from_str::<InternalWsClientMessage>(&text) {
+                    handle_ws_client_message(&registry, &instance_id, frame);
+                }
+            }
+            Message::Binary(binary) => {
+                if let Ok(frame) = serde_json::from_slice::<InternalWsClientMessage>(&binary) {
+                    handle_ws_client_message(&registry, &instance_id, frame);
+                }
+            }
+            Message::Close(_) => break,
+            Message::Ping(_) | Message::Pong(_) => {}
+        }
+    }
+
+    send_task.abort();
+
+    let mut registry = registry.lock().expect("registry lock poisoned");
+    if let Some(instance) = registry.instances.get_mut(&instance_id) {
+        instance.ws_tx = None;
+    }
+}
+
+async fn send_ws_commands(
+    sender: &mut SplitSink<WebSocket, Message>,
+    rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+) {
+    while let Some(command) = rx.recv().await {
+        let message = match serde_json::to_vec(&InternalWsServerMessage::Command { data: command })
+        {
+            Ok(message) => message,
+            Err(_) => continue,
+        };
+
+        if sender.send(Message::Binary(message.into())).await.is_err() {
+            break;
+        }
+    }
+}
+
+fn handle_ws_client_message(
+    registry: &SharedRegistry,
+    instance_id: &str,
+    message: InternalWsClientMessage,
+) {
+    match message {
+        InternalWsClientMessage::Output { data } => {
+            let mut registry = registry.lock().expect("registry lock poisoned");
+            let Some(instance) = registry.instances.get_mut(instance_id) else {
+                return;
+            };
+
+            instance.screen.process(&data);
+            instance.screen_tail = render_screen_tail(&instance.screen);
+            apply_observation(instance);
+            instance.updated_at_ms = now_millis();
+        }
+        InternalWsClientMessage::Resize { rows, cols } => {
+            let mut registry = registry.lock().expect("registry lock poisoned");
+            let Some(instance) = registry.instances.get_mut(instance_id) else {
+                return;
+            };
+
+            instance.screen.screen_mut().set_size(rows, cols);
+            instance.screen_tail = render_screen_tail(&instance.screen);
+            apply_observation(instance);
+            instance.updated_at_ms = now_millis();
+        }
     }
 }
 
@@ -335,7 +412,14 @@ fn queue_adapter_action(
 
     let command = build_command(instance)?;
     let adapter = Some(instance.adapter.name().to_string());
-    instance.command_queue.push_back(command);
+    if let Some(ws_tx) = &instance.ws_tx {
+        if ws_tx.send(command.clone()).is_err() {
+            instance.ws_tx = None;
+            instance.command_queue.push_back(command);
+        }
+    } else {
+        instance.command_queue.push_back(command);
+    }
     instance.updated_at_ms = now_millis();
 
     Ok((
@@ -363,7 +447,14 @@ fn queue_command(
         return Err(ApiError::ProcessExited);
     }
 
-    instance.command_queue.push_back(command);
+    if let Some(ws_tx) = &instance.ws_tx {
+        if ws_tx.send(command.clone()).is_err() {
+            instance.ws_tx = None;
+            instance.command_queue.push_back(command);
+        }
+    } else {
+        instance.command_queue.push_back(command);
+    }
     instance.updated_at_ms = now_millis();
 
     Ok((
@@ -424,8 +515,6 @@ enum ApiError {
     NotFound,
     #[error("agent instance has exited")]
     ProcessExited,
-    #[error("{0}")]
-    UnsupportedAction(String),
     #[error(transparent)]
     Adapter(#[from] AdapterError),
 }
@@ -435,7 +524,6 @@ impl ApiError {
         match self {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::ProcessExited => StatusCode::CONFLICT,
-            Self::UnsupportedAction(_) => StatusCode::NOT_IMPLEMENTED,
             Self::Adapter(error) => {
                 StatusCode::from_u16(error.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
             }
@@ -446,7 +534,6 @@ impl ApiError {
         match self {
             Self::NotFound => "not_found",
             Self::ProcessExited => "process_exited",
-            Self::UnsupportedAction(_) => "unsupported_action",
             Self::Adapter(error) => error.code(),
         }
     }

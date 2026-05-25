@@ -6,9 +6,10 @@ description = "Foreground TUI agent wrapper with a local RPC control service"
 
 [dependencies]
 anyhow = "1"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
+futures-util = "0.3"
 portable-pty = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
 serde = { version = "1", features = ["derive"] }
@@ -17,6 +18,8 @@ serde_urlencoded = "0.7"
 signal-hook = "0.3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tokio-tungstenite = "0.28"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tungstenite = "0.28"
 vt100 = "0.16"

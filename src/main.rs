@@ -2,6 +2,7 @@ mod adapters;
 mod api;
 mod daemon;
 mod http;
+mod internal;
 mod pty;
 mod util;
 mod wrapper;

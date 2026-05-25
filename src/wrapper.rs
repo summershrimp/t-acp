@@ -1,6 +1,6 @@
 use crate::adapters;
 use crate::api::{ExitRequest, RegisterAgentRequest};
-use crate::http::ControlClient;
+use crate::http::{ControlClient, InternalWsHandle};
 use crate::pty;
 use crate::util::{now_millis, sanitize_id_part};
 use anyhow::{Context, Result, bail};
@@ -45,26 +45,19 @@ pub fn run(mut args: Vec<String>, addr: &str) -> Result<u8> {
         child_pty.pid,
         &cwd,
         &command,
+        initial_size.rows,
+        initial_size.cols,
     )?;
+    let ws = client.connect_agent_ws(&instance_id)?;
 
     let _raw_mode = RawMode::enter().ok();
     let stop = Arc::new(AtomicBool::new(false));
     let pty_writer = Arc::new(Mutex::new(child_pty.writer));
 
     spawn_stdin_forwarder(Arc::clone(&pty_writer), Arc::clone(&stop));
-    spawn_rpc_forwarder(
-        client.clone(),
-        instance_id.clone(),
-        Arc::clone(&pty_writer),
-        Arc::clone(&stop),
-    );
-    spawn_resize_forwarder(child_pty.master.clone(), Arc::clone(&stop));
-    let output_handle = spawn_output_forwarder(
-        client.clone(),
-        instance_id.clone(),
-        child_pty.reader,
-        Arc::clone(&stop),
-    );
+    spawn_rpc_forwarder(ws.clone(), Arc::clone(&pty_writer), Arc::clone(&stop));
+    spawn_resize_forwarder(ws.clone(), child_pty.master.clone(), Arc::clone(&stop));
+    let output_handle = spawn_output_forwarder(ws, child_pty.reader, Arc::clone(&stop));
 
     let exit_status = child_pty.child.wait().context("failed to wait for child")?;
     stop.store(true, Ordering::SeqCst);
@@ -110,6 +103,8 @@ fn register_instance(
     pid: Option<u32>,
     cwd: &str,
     command: &str,
+    rows: u16,
+    cols: u16,
 ) -> Result<()> {
     client
         .register_agent(&RegisterAgentRequest {
@@ -118,6 +113,8 @@ fn register_instance(
             pid,
             cwd: cwd.to_string(),
             command: command.to_string(),
+            rows,
+            cols,
         })
         .map(|_| ())
 }
@@ -154,27 +151,26 @@ fn spawn_stdin_forwarder(
 }
 
 fn spawn_rpc_forwarder(
-    client: ControlClient,
-    instance_id: String,
+    mut ws: InternalWsHandle,
     pty_writer: SharedPtyWriter,
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         while !stop.load(Ordering::SeqCst) {
-            match client.pop_command(&instance_id) {
-                Ok(Some(command)) if !command.is_empty() => {
+            match ws.recv_command_timeout(Duration::from_millis(100)) {
+                Some(command) if !command.is_empty() => {
                     if write_to_pty(&pty_writer, &command).is_err() {
                         break;
                     }
                 }
-                Ok(_) => thread::sleep(Duration::from_millis(50)),
-                Err(_) => thread::sleep(Duration::from_millis(250)),
+                _ => {}
             }
         }
     })
 }
 
 fn spawn_resize_forwarder(
+    ws: InternalWsHandle,
     pty_master: pty::SharedMasterPty,
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
@@ -190,13 +186,13 @@ fn spawn_resize_forwarder(
 
             let (cols, rows) = size().unwrap_or((80, 24));
             let _ = pty::resize(&pty_master, rows, cols);
+            let _ = ws.send_resize(rows, cols);
         }
     })
 }
 
 fn spawn_output_forwarder(
-    client: ControlClient,
-    instance_id: String,
+    ws: InternalWsHandle,
     mut pty_reader: Box<dyn Read + Send>,
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
@@ -213,7 +209,7 @@ fn spawn_output_forwarder(
                         break;
                     }
                     let _ = stdout.flush();
-                    let _ = client.post_output(&instance_id, chunk);
+                    let _ = ws.send_output(chunk);
                 }
                 Err(_) => break,
             }

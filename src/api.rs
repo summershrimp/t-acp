@@ -40,6 +40,8 @@ pub struct RegisterAgentRequest {
     pub pid: Option<u32>,
     pub cwd: String,
     pub command: String,
+    pub rows: u16,
+    pub cols: u16,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
