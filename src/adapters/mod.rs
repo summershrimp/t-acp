@@ -117,6 +117,18 @@ pub trait Adapter: Sync {
         Ok(b"\x1b".to_vec())
     }
 
+    fn previous_model(&self) -> Result<Vec<u8>, AdapterError> {
+        Err(AdapterError::UnsupportedAction(
+            "previous-model needs an adapter-specific implementation".to_string(),
+        ))
+    }
+
+    fn next_model(&self) -> Result<Vec<u8>, AdapterError> {
+        Err(AdapterError::UnsupportedAction(
+            "next-model needs an adapter-specific implementation".to_string(),
+        ))
+    }
+
     fn switch_model(&self, _body: &[u8]) -> Result<Vec<u8>, AdapterError> {
         Err(AdapterError::UnsupportedAction(
             "switch-model needs an adapter-specific implementation".to_string(),

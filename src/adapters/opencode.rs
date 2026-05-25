@@ -70,6 +70,14 @@ impl Adapter for OpencodeAdapter {
         Ok(b"\x1b".to_vec())
     }
 
+    fn previous_model(&self) -> Result<Vec<u8>, AdapterError> {
+        Ok(b"\x1b[1;2Q".to_vec())
+    }
+
+    fn next_model(&self) -> Result<Vec<u8>, AdapterError> {
+        Ok(b"\x1bOQ".to_vec())
+    }
+
     fn switch_model(&self, _body: &[u8]) -> Result<Vec<u8>, AdapterError> {
         Err(AdapterError::UnsupportedAction(
             "opencode runtime model switching needs a stable TUI shortcut or command before it can be automated safely".to_string(),
@@ -414,5 +422,15 @@ mod tests {
             .switch_model(b"anthropic/claude")
             .unwrap_err();
         assert_eq!(error.code(), "unsupported_action");
+    }
+
+    #[test]
+    fn next_model_uses_f2() {
+        assert_eq!(OpencodeAdapter.next_model().unwrap(), b"\x1bOQ");
+    }
+
+    #[test]
+    fn previous_model_uses_shift_f2() {
+        assert_eq!(OpencodeAdapter.previous_model().unwrap(), b"\x1b[1;2Q");
     }
 }

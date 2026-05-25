@@ -68,6 +68,14 @@ pub async fn run(addr: &str) -> Result<()> {
             post(action_reject_permission),
         )
         .route(
+            "/agents/{instance_id}/actions/previous-model",
+            post(action_previous_model),
+        )
+        .route(
+            "/agents/{instance_id}/actions/next-model",
+            post(action_next_model),
+        )
+        .route(
             "/agents/{instance_id}/actions/switch-model",
             post(action_switch_model),
         )
@@ -156,6 +164,24 @@ async fn action_reject_permission(
         instance
             .adapter
             .reject_permission(instance.screen_tail.as_bytes())
+    })
+}
+
+async fn action_previous_model(
+    State(registry): State<SharedRegistry>,
+    Path(instance_id): Path<String>,
+) -> Result<(StatusCode, Json<ActionQueued>), ApiError> {
+    queue_adapter_action(&registry, &instance_id, |instance| {
+        instance.adapter.previous_model()
+    })
+}
+
+async fn action_next_model(
+    State(registry): State<SharedRegistry>,
+    Path(instance_id): Path<String>,
+) -> Result<(StatusCode, Json<ActionQueued>), ApiError> {
+    queue_adapter_action(&registry, &instance_id, |instance| {
+        instance.adapter.next_model()
     })
 }
 

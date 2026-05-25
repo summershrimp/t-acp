@@ -205,6 +205,20 @@ curl -X DELETE \
 - 对 `opencode`：只有检测到权限弹窗时才会排队执行。
 - 当前实现发送 `Esc`。
 
+#### `POST /agents/{instance_id}/actions/previous-model`
+
+切换到上一个模型。
+
+- 对 `opencode`：发送 `Shift+F2`
+- generic adapter 当前返回 `501 unsupported_action`
+
+#### `POST /agents/{instance_id}/actions/next-model`
+
+切换到下一个模型。
+
+- 对 `opencode`：发送 `F2`
+- generic adapter 当前返回 `501 unsupported_action`
+
 #### `POST /agents/{instance_id}/actions/switch-model`
 
 预留接口。
