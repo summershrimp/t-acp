@@ -163,6 +163,12 @@ impl InternalWsHandle {
             .send(InternalWsClientMessage::Resize { rows, cols })
             .map_err(|_| anyhow::anyhow!("internal websocket disconnected"))
     }
+
+    pub fn send_focus(&self, focused: bool) -> Result<()> {
+        self.output_tx
+            .send(InternalWsClientMessage::Focus { focused })
+            .map_err(|_| anyhow::anyhow!("internal websocket disconnected"))
+    }
 }
 
 impl Clone for InternalWsHandle {

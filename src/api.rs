@@ -22,6 +22,7 @@ pub struct AgentView {
     pub current_reasoning_effort: Option<String>,
     pub current_context_window: Option<String>,
     pub current_context_usage_percent: Option<u8>,
+    pub focused: bool,
     pub exit_status: Option<String>,
     pub created_at_ms: u128,
     pub updated_at_ms: u128,

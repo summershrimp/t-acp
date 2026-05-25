@@ -45,6 +45,7 @@ struct AgentInstance {
     current_reasoning_effort: Option<String>,
     current_context_window: Option<String>,
     current_context_usage_percent: Option<u8>,
+    focused: bool,
     exit_status: Option<String>,
     screen: vt100::Parser,
     screen_tail: String,
@@ -230,6 +231,7 @@ async fn register_agent(
         current_reasoning_effort: observation.current_reasoning_effort,
         current_context_window: observation.current_context_window,
         current_context_usage_percent: observation.current_context_usage_percent,
+        focused: false,
         exit_status: None,
         screen: vt100::Parser::new(request.rows, request.cols, 2000),
         screen_tail: String::new(),
@@ -392,6 +394,15 @@ fn handle_ws_client_message(
             apply_observation(instance);
             instance.updated_at_ms = now_millis();
         }
+        InternalWsClientMessage::Focus { focused } => {
+            let mut registry = registry.lock().expect("registry lock poisoned");
+            let Some(instance) = registry.instances.get_mut(instance_id) else {
+                return;
+            };
+
+            instance.focused = focused;
+            instance.updated_at_ms = now_millis();
+        }
     }
 }
 
@@ -501,6 +512,7 @@ impl AgentInstance {
             current_reasoning_effort: self.current_reasoning_effort.clone(),
             current_context_window: self.current_context_window.clone(),
             current_context_usage_percent: self.current_context_usage_percent,
+            focused: self.focused,
             exit_status: self.exit_status.clone(),
             created_at_ms: self.created_at_ms,
             updated_at_ms: self.updated_at_ms,

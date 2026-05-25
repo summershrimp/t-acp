@@ -241,7 +241,7 @@ curl -X DELETE \
 当前 wrapper 与 daemon 之间通过 `/internal/agents/{instance_id}/ws` 传输：
 
 - wrapper 通过 WebSocket 上报 PTY output
-- wrapper 通过 WebSocket 上报 resize 等内部运行时事件
+- wrapper 通过 WebSocket 上报 resize、focus 等内部运行时事件
 - daemon 通过同一条 WebSocket 下发待执行命令
 
 ## 数据模型
@@ -265,6 +265,7 @@ curl -X DELETE \
   "current_reasoning_effort": "high",
   "current_context_window": "42.6K",
   "current_context_usage_percent": 21,
+  "focused": true,
   "exit_status": null,
   "created_at_ms": 1716620000000,
   "updated_at_ms": 1716620001234,
@@ -283,7 +284,10 @@ curl -X DELETE \
 - `current_reasoning_effort`: 当前思考强度，例如 `high`
 - `current_context_window`: 右下角显示的当前上下文长度，例如 `42.6K`
 - `current_context_usage_percent`: 右下角显示的上下文占用百分比，例如 `21`
+- `focused`: 外层终端当前是否处于 focus 状态
 - `screen_tail`: daemon 维护的最近终端屏幕文本，用于状态观察和适配器判断
+
+如果在 `tmux` 里使用时发现 `focused` 状态不准确，需要启用 `tmux` 的 focus 事件转发：`set -g focus-events on`。
 
 ## 适配器说明
 

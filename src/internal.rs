@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub enum InternalWsClientMessage {
     Output { data: Vec<u8> },
     Resize { rows: u16, cols: u16 },
+    Focus { focused: bool },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
