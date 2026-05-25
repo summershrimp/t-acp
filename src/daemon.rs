@@ -1,0 +1,408 @@
+use crate::adapters::{self, AdapterError};
+use crate::api::{
+    ActionQueued, AgentList, AgentView, ErrorBody, ExitRequest, HealthResponse,
+    RegisterAgentRequest,
+};
+use crate::util::now_millis;
+use anyhow::{Context, Result};
+use axum::body::Bytes;
+use axum::extract::{Path, State};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use thiserror::Error;
+use tracing::info;
+
+type SharedRegistry = Arc<Mutex<Registry>>;
+
+#[derive(Default)]
+struct Registry {
+    instances: HashMap<String, AgentInstance>,
+}
+
+struct AgentInstance {
+    id: String,
+    agent_kind: String,
+    adapter_name: String,
+    pid: Option<u32>,
+    cwd: String,
+    command: String,
+    status: String,
+    ui_mode: String,
+    blocking_reason: Option<String>,
+    current_model: Option<String>,
+    exit_status: Option<String>,
+    screen: vt100::Parser,
+    screen_tail: String,
+    command_queue: VecDeque<Vec<u8>>,
+    created_at_ms: u128,
+    updated_at_ms: u128,
+}
+
+pub async fn run(addr: &str) -> Result<()> {
+    let registry = Arc::new(Mutex::new(Registry::default()));
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/agents", get(list_agents))
+        .route("/agents/{instance_id}", get(get_agent).delete(delete_agent))
+        .route("/agents/{instance_id}/input", post(post_input))
+        .route(
+            "/agents/{instance_id}/actions/send-prompt",
+            post(action_send_prompt),
+        )
+        .route(
+            "/agents/{instance_id}/actions/approve-permission",
+            post(action_approve_permission),
+        )
+        .route(
+            "/agents/{instance_id}/actions/reject-permission",
+            post(action_reject_permission),
+        )
+        .route(
+            "/agents/{instance_id}/actions/switch-model",
+            post(action_switch_model),
+        )
+        .route("/agents/{instance_id}/resize", post(remote_resize))
+        .route("/internal/agents/register", post(register_agent))
+        .route("/internal/agents/{instance_id}/output", post(append_output))
+        .route("/internal/agents/{instance_id}/exit", post(mark_exited))
+        .route("/internal/agents/{instance_id}/commands", get(pop_command))
+        .with_state(registry);
+
+    let addr = addr
+        .parse::<SocketAddr>()
+        .with_context(|| format!("invalid listen address {addr}"))?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind {addr}"))?;
+    info!("t-acp daemon listening on http://{addr}");
+
+    axum::serve(listener, app)
+        .await
+        .context("axum server failed")
+}
+
+async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse { ok: true })
+}
+
+async fn list_agents(State(registry): State<SharedRegistry>) -> Json<AgentList> {
+    let registry = registry.lock().expect("registry lock poisoned");
+    Json(AgentList {
+        agents: registry
+            .instances
+            .values()
+            .map(AgentInstance::view)
+            .collect(),
+    })
+}
+
+async fn get_agent(
+    State(registry): State<SharedRegistry>,
+    Path(instance_id): Path<String>,
+) -> Result<Json<AgentView>, ApiError> {
+    let registry = registry.lock().expect("registry lock poisoned");
+    let instance = registry
+        .instances
+        .get(&instance_id)
+        .ok_or(ApiError::NotFound)?;
+
+    Ok(Json(instance.view()))
+}
+
+async fn post_input(
+    State(registry): State<SharedRegistry>,
+    Path(instance_id): Path<String>,
+    body: Bytes,
+) -> Result<(StatusCode, Json<ActionQueued>), ApiError> {
+    queue_command(&registry, &instance_id, body.to_vec(), None)
+}
+
+async fn action_send_prompt(
+    State(registry): State<SharedRegistry>,
+    Path(instance_id): Path<String>,
+    body: Bytes,
+) -> Result<(StatusCode, Json<ActionQueued>), ApiError> {
+    queue_adapter_action(&registry, &instance_id, |instance| {
+        adapters::send_prompt(&instance.agent_kind, &body)
+    })
+}
+
+async fn action_approve_permission(
+    State(registry): State<SharedRegistry>,
+    Path(instance_id): Path<String>,
+) -> Result<(StatusCode, Json<ActionQueued>), ApiError> {
+    queue_adapter_action(&registry, &instance_id, |instance| {
+        adapters::approve_permission(&instance.agent_kind, instance.screen_tail.as_bytes())
+    })
+}
+
+async fn action_reject_permission(
+    State(registry): State<SharedRegistry>,
+    Path(instance_id): Path<String>,
+) -> Result<(StatusCode, Json<ActionQueued>), ApiError> {
+    queue_adapter_action(&registry, &instance_id, |instance| {
+        adapters::reject_permission(&instance.agent_kind, instance.screen_tail.as_bytes())
+    })
+}
+
+async fn action_switch_model(
+    State(registry): State<SharedRegistry>,
+    Path(instance_id): Path<String>,
+    body: Bytes,
+) -> Result<(StatusCode, Json<ActionQueued>), ApiError> {
+    queue_adapter_action(&registry, &instance_id, |instance| {
+        adapters::switch_model(&instance.agent_kind, &body)
+    })
+}
+
+async fn remote_resize() -> Result<Json<ErrorBody>, ApiError> {
+    Err(ApiError::UnsupportedAction(
+        "remote resize is not wired yet".to_string(),
+    ))
+}
+
+async fn delete_agent(
+    State(registry): State<SharedRegistry>,
+    Path(instance_id): Path<String>,
+) -> Result<(StatusCode, Json<ActionQueued>), ApiError> {
+    queue_command(&registry, &instance_id, b"\x03".to_vec(), None)
+}
+
+async fn register_agent(
+    State(registry): State<SharedRegistry>,
+    Json(request): Json<RegisterAgentRequest>,
+) -> Result<(StatusCode, Json<AgentView>), ApiError> {
+    let agent_kind = adapters::canonical_agent_kind(&request.agent_kind);
+    let observation = adapters::observe(&agent_kind, &[]);
+    let now = now_millis();
+    let instance = AgentInstance {
+        id: request.id.clone(),
+        agent_kind: agent_kind.clone(),
+        adapter_name: adapters::adapter_name(&agent_kind).to_string(),
+        pid: request.pid,
+        cwd: request.cwd,
+        command: request.command,
+        status: observation.status.as_str().to_string(),
+        ui_mode: observation.ui_mode.as_str().to_string(),
+        blocking_reason: observation.blocking_reason,
+        current_model: observation.current_model,
+        exit_status: None,
+        screen: vt100::Parser::new(24, 80, 2000),
+        screen_tail: String::new(),
+        command_queue: VecDeque::new(),
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    let view = instance.view();
+
+    registry
+        .lock()
+        .expect("registry lock poisoned")
+        .instances
+        .insert(request.id, instance);
+
+    Ok((StatusCode::CREATED, Json(view)))
+}
+
+async fn append_output(
+    State(registry): State<SharedRegistry>,
+    Path(instance_id): Path<String>,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let mut registry = registry.lock().expect("registry lock poisoned");
+    let instance = registry
+        .instances
+        .get_mut(&instance_id)
+        .ok_or(ApiError::NotFound)?;
+
+    instance.screen.process(&body);
+    instance.screen_tail = instance.screen.screen().contents();
+    apply_observation(instance);
+    instance.updated_at_ms = now_millis();
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn mark_exited(
+    State(registry): State<SharedRegistry>,
+    Path(instance_id): Path<String>,
+    Json(request): Json<ExitRequest>,
+) -> Result<StatusCode, ApiError> {
+    let mut registry = registry.lock().expect("registry lock poisoned");
+    let instance = registry
+        .instances
+        .get_mut(&instance_id)
+        .ok_or(ApiError::NotFound)?;
+
+    instance.status = "exited".to_string();
+    instance.ui_mode = "unknown".to_string();
+    instance.blocking_reason = None;
+    instance.exit_status = Some(request.status);
+    instance.updated_at_ms = now_millis();
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn pop_command(
+    State(registry): State<SharedRegistry>,
+    Path(instance_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let mut registry = registry.lock().expect("registry lock poisoned");
+    let instance = registry
+        .instances
+        .get_mut(&instance_id)
+        .ok_or(ApiError::NotFound)?;
+
+    if let Some(command) = instance.command_queue.pop_front() {
+        instance.updated_at_ms = now_millis();
+        Ok((
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            command,
+        )
+            .into_response())
+    } else {
+        Ok(StatusCode::NO_CONTENT.into_response())
+    }
+}
+
+fn queue_adapter_action(
+    registry: &SharedRegistry,
+    instance_id: &str,
+    build_command: impl FnOnce(&AgentInstance) -> Result<Vec<u8>, AdapterError>,
+) -> Result<(StatusCode, Json<ActionQueued>), ApiError> {
+    let mut registry = registry.lock().expect("registry lock poisoned");
+    let instance = registry
+        .instances
+        .get_mut(instance_id)
+        .ok_or(ApiError::NotFound)?;
+
+    if instance.status == "exited" {
+        return Err(ApiError::ProcessExited);
+    }
+
+    let command = build_command(instance)?;
+    let adapter = Some(instance.adapter_name.clone());
+    instance.command_queue.push_back(command);
+    instance.updated_at_ms = now_millis();
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ActionQueued {
+            queued: true,
+            adapter,
+        }),
+    ))
+}
+
+fn queue_command(
+    registry: &SharedRegistry,
+    instance_id: &str,
+    command: Vec<u8>,
+    adapter: Option<String>,
+) -> Result<(StatusCode, Json<ActionQueued>), ApiError> {
+    let mut registry = registry.lock().expect("registry lock poisoned");
+    let instance = registry
+        .instances
+        .get_mut(instance_id)
+        .ok_or(ApiError::NotFound)?;
+
+    if instance.status == "exited" {
+        return Err(ApiError::ProcessExited);
+    }
+
+    instance.command_queue.push_back(command);
+    instance.updated_at_ms = now_millis();
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ActionQueued {
+            queued: true,
+            adapter,
+        }),
+    ))
+}
+
+fn apply_observation(instance: &mut AgentInstance) {
+    if instance.status == "exited" {
+        return;
+    }
+
+    let observation = adapters::observe(&instance.agent_kind, instance.screen_tail.as_bytes());
+    instance.status = observation.status.as_str().to_string();
+    instance.ui_mode = observation.ui_mode.as_str().to_string();
+    instance.blocking_reason = observation.blocking_reason;
+    instance.current_model = observation.current_model;
+}
+
+impl AgentInstance {
+    fn view(&self) -> AgentView {
+        AgentView {
+            id: self.id.clone(),
+            agent_kind: self.agent_kind.clone(),
+            adapter: self.adapter_name.clone(),
+            pid: self.pid,
+            cwd: self.cwd.clone(),
+            command: self.command.clone(),
+            status: self.status.clone(),
+            ui_mode: self.ui_mode.clone(),
+            blocking_reason: self.blocking_reason.clone(),
+            current_model: self.current_model.clone(),
+            exit_status: self.exit_status.clone(),
+            created_at_ms: self.created_at_ms,
+            updated_at_ms: self.updated_at_ms,
+            screen_tail: self.screen_tail.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+enum ApiError {
+    #[error("agent instance not found")]
+    NotFound,
+    #[error("agent instance has exited")]
+    ProcessExited,
+    #[error("{0}")]
+    UnsupportedAction(String),
+    #[error(transparent)]
+    Adapter(#[from] AdapterError),
+}
+
+impl ApiError {
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::ProcessExited => StatusCode::CONFLICT,
+            Self::UnsupportedAction(_) => StatusCode::NOT_IMPLEMENTED,
+            Self::Adapter(error) => {
+                StatusCode::from_u16(error.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        }
+    }
+
+    fn code(&self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::ProcessExited => "process_exited",
+            Self::UnsupportedAction(_) => "unsupported_action",
+            Self::Adapter(error) => error.code(),
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let status = self.status();
+        let body = ErrorBody {
+            error: self.code().to_string(),
+            message: self.to_string(),
+        };
+
+        (status, Json(body)).into_response()
+    }
+}
