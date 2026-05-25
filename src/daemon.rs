@@ -1,4 +1,4 @@
-use crate::adapters::{self, AdapterError};
+use crate::adapters::{self, Adapter, AdapterError};
 use crate::api::{
     ActionQueued, AgentList, AgentView, ErrorBody, ExitRequest, HealthResponse,
     RegisterAgentRequest,
@@ -27,7 +27,7 @@ struct Registry {
 struct AgentInstance {
     id: String,
     agent_kind: String,
-    adapter_name: String,
+    adapter: &'static dyn Adapter,
     pid: Option<u32>,
     cwd: String,
     command: String,
@@ -128,7 +128,7 @@ async fn action_send_prompt(
     body: Bytes,
 ) -> Result<(StatusCode, Json<ActionQueued>), ApiError> {
     queue_adapter_action(&registry, &instance_id, |instance| {
-        adapters::send_prompt(&instance.agent_kind, &body)
+        instance.adapter.send_prompt(&body)
     })
 }
 
@@ -137,7 +137,9 @@ async fn action_approve_permission(
     Path(instance_id): Path<String>,
 ) -> Result<(StatusCode, Json<ActionQueued>), ApiError> {
     queue_adapter_action(&registry, &instance_id, |instance| {
-        adapters::approve_permission(&instance.agent_kind, instance.screen_tail.as_bytes())
+        instance
+            .adapter
+            .approve_permission(instance.screen_tail.as_bytes())
     })
 }
 
@@ -146,7 +148,9 @@ async fn action_reject_permission(
     Path(instance_id): Path<String>,
 ) -> Result<(StatusCode, Json<ActionQueued>), ApiError> {
     queue_adapter_action(&registry, &instance_id, |instance| {
-        adapters::reject_permission(&instance.agent_kind, instance.screen_tail.as_bytes())
+        instance
+            .adapter
+            .reject_permission(instance.screen_tail.as_bytes())
     })
 }
 
@@ -156,7 +160,7 @@ async fn action_switch_model(
     body: Bytes,
 ) -> Result<(StatusCode, Json<ActionQueued>), ApiError> {
     queue_adapter_action(&registry, &instance_id, |instance| {
-        adapters::switch_model(&instance.agent_kind, &body)
+        instance.adapter.switch_model(&body)
     })
 }
 
@@ -178,12 +182,13 @@ async fn register_agent(
     Json(request): Json<RegisterAgentRequest>,
 ) -> Result<(StatusCode, Json<AgentView>), ApiError> {
     let agent_kind = adapters::canonical_agent_kind(&request.agent_kind);
-    let observation = adapters::observe(&agent_kind, &[]);
+    let adapter = adapters::for_agent_kind(&agent_kind);
+    let observation = adapter.observe(&[]);
     let now = now_millis();
     let instance = AgentInstance {
         id: request.id.clone(),
         agent_kind: agent_kind.clone(),
-        adapter_name: adapters::adapter_name(&agent_kind).to_string(),
+        adapter,
         pid: request.pid,
         cwd: request.cwd,
         command: request.command,
@@ -287,7 +292,7 @@ fn queue_adapter_action(
     }
 
     let command = build_command(instance)?;
-    let adapter = Some(instance.adapter_name.clone());
+    let adapter = Some(instance.adapter.name().to_string());
     instance.command_queue.push_back(command);
     instance.updated_at_ms = now_millis();
 
@@ -333,7 +338,7 @@ fn apply_observation(instance: &mut AgentInstance) {
         return;
     }
 
-    let observation = adapters::observe(&instance.agent_kind, instance.screen_tail.as_bytes());
+    let observation = instance.adapter.observe(instance.screen_tail.as_bytes());
     instance.status = observation.status.as_str().to_string();
     instance.ui_mode = observation.ui_mode.as_str().to_string();
     instance.blocking_reason = observation.blocking_reason;
@@ -345,7 +350,7 @@ impl AgentInstance {
         AgentView {
             id: self.id.clone(),
             agent_kind: self.agent_kind.clone(),
-            adapter: self.adapter_name.clone(),
+            adapter: self.adapter.name().to_string(),
             pid: self.pid,
             cwd: self.cwd.clone(),
             command: self.command.clone(),
