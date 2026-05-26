@@ -120,10 +120,10 @@ impl ControlClient {
                         Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => None,
                     };
 
-                    if let Some(InternalWsServerMessage::Command { data }) = payload {
-                        if command_tx.send(data).is_err() {
-                            break;
-                        }
+                    if let Some(InternalWsServerMessage::Command { data }) = payload
+                        && command_tx.send(data).is_err()
+                    {
+                        break;
                     }
                 }
 

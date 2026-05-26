@@ -2,9 +2,16 @@
 
 ## Summary
 
-Build a Linux-first local control system where users launch supported agents through `t-acp`, for example `t-acp opencode`. In this model, `t-acp` directly wraps the agent's interactive TTY session so the user can keep using keyboard and mouse normally, while a background service tracks all launched sessions and exposes high-level RPC control over concrete running agent instances via HTTP and WebSocket.
+Build a Unix-first local control system where users launch supported agents through `t-acp`, for example `t-acp opencode`. In this model, `t-acp` directly wraps the agent's interactive TTY session so the user can keep using keyboard and mouse normally, while a background service tracks all launched sessions and exposes high-level RPC control over concrete running agent instances via HTTP and WebSocket.
 
 The MVP focuses on `opencode` first, but the architecture must make future support for `codex`, `claude-code`, and other agents straightforward through a stable internal adapter interface. The control model should prioritize stable, deterministic terminal interactions instead of human-like clicking. Default control paths should use keyboard navigation, paste, known shortcuts, and focus movement; screen-location mouse simulation can be added later as an enhancement. UI understanding should use a hybrid approach: maintain a full virtual terminal buffer and also surface incremental signals from the output stream for faster state transitions.
+
+## Current MVP Status
+
+- Implemented: foreground wrapper, daemon bootstrap, PTY capture, vt100 screen parsing, instance registry, opencode adapter, structure-preserving human interaction submission, and a zero-build observation HTML page.
+- Implemented: internal wrapper-to-daemon WebSocket at `/internal/agents/:instance_id/ws` for PTY output, resize events, and queued command delivery.
+- Implemented: HTTP polling observation via `/observe`, `/agents/:instance_id/observe`, and `/agents/:instance_id/observations`.
+- Deferred: public event WebSocket, public remote resize, dynamic plugin loading, and reliable adapter implementations for codex or Claude Code.
 
 ## Key Changes
 
@@ -15,6 +22,7 @@ The MVP focuses on `opencode` first, but the architecture must make future suppo
   - `t-acp background service` tracks all active sessions, maintains parsed terminal state, serializes remote actions, and serves RPC/event APIs.
 - When the user runs `t-acp <agent> [agent-args...]`, `t-acp` should:
   - ensure the background service is running, starting it automatically if needed
+  - keep auto-started background service lifetime independent from short-lived wrapper commands
   - create and register a new tracked session
   - launch the target agent attached to a PTY controlled by `t-acp`
   - attach the foreground wrapper to that session so the user remains directly interactive
@@ -39,7 +47,9 @@ The MVP focuses on `opencode` first, but the architecture must make future suppo
   - agent-specific launch, parsing, UI recognition, and action execution
 - `control API`
   - instance-centric HTTP RPC
-  - WebSocket for session state, screen diff, and action result events
+  - internal WebSocket for wrapper-daemon runtime traffic
+  - HTTP polling observation for screen, events, and raw PTY tail
+  - public WebSocket events remain a later extension
 
 ### Public Interfaces and Types
 
@@ -64,18 +74,27 @@ The MVP focuses on `opencode` first, but the architecture must make future suppo
 - Expose HTTP endpoints with instance-first routing:
   - `GET /agents`
   - `GET /agents/:instance_id`
+  - `GET /observe`
+  - `GET /agents/:instance_id/observe`
+  - `GET /agents/:instance_id/observations`
   - `POST /agents/:instance_id/input`
-  - `POST /agents/:instance_id/actions/approve-permission`
-  - `POST /agents/:instance_id/actions/reject-permission`
-  - `POST /agents/:instance_id/actions/switch-model`
+  - `POST /agents/:instance_id/interaction`
   - `POST /agents/:instance_id/actions/send-prompt`
-  - `POST /agents/:instance_id/resize`
+  - `POST /agents/:instance_id/actions/previous-model`
+  - `POST /agents/:instance_id/actions/next-model`
+  - `POST /agents/:instance_id/actions/switch-model`
   - `DELETE /agents/:instance_id`
-- Expose WebSocket events:
+- Treat `switch-model` as an exposed but currently unsupported action until there is a stable TUI shortcut or command flow for opencode.
+- Keep the current remote resize surface deferred; wrapper-local `SIGWINCH` still updates the wrapped PTY and daemon screen model through the internal WebSocket.
+- Keep the current WebSocket internal to wrapper-daemon runtime traffic:
+  - wrapper sends PTY output frames
+  - wrapper sends terminal resize frames
+  - daemon sends queued command frames
+- Future public WebSocket events may include:
   - `instance_started`
   - `instance_state_changed`
   - `screen_updated`
-  - `permission_detected`
+  - `interaction_detected`
   - `action_result`
   - `instance_exited`
 
@@ -86,6 +105,7 @@ The MVP focuses on `opencode` first, but the architecture must make future suppo
   - mouse events and terminal resize events also pass through
   - terminal output is mirrored into the parsed session state used by RPC controllers
 - Maintain a virtual terminal screen buffer instead of only storing raw output text.
+- Initialize the virtual terminal from the wrapper-reported terminal size and keep it synchronized with wrapper resize events; tolerate CSI cursor coordinates that imply a larger screen than the last explicit size.
 - Retain recent snapshots or diffs to support state recognition and debugging.
 - Support the common ANSI/VT control sequences needed by modern TUI agents.
 - Let each adapter perform structured recognition over the parsed screen state, including:
@@ -96,7 +116,7 @@ The MVP focuses on `opencode` first, but the architecture must make future suppo
 - Use incremental output parsing only as an accelerator for key state transitions, not as the primary source of truth.
 - Implement high-level actions with post-condition checks:
   - `send_prompt`: prefer paste plus submit
-  - `approve_permission`: prefer shortcuts or deterministic focus navigation
+  - `submit_interaction`: route permission, question, and future human-intervention prompts through adapter-specific structured options
   - `switch_model`: adapter-defined sequence plus success verification
 - Define input arbitration between the local foreground user and remote RPC control:
   - only one injected remote action sequence may run at a time per session
@@ -104,11 +124,12 @@ The MVP focuses on `opencode` first, but the architecture must make future suppo
   - the MVP should favor deterministic remote action execution over unrestricted concurrent writes
 - Return structured failures instead of assuming success:
   - `unsupported_action`
-  - `ui_not_detected`
+  - `bad_request`
   - `ambiguous_ui_state`
   - `action_timeout`
   - `process_exited`
   - `pty_io_error`
+- Keep human-interaction ids semantic and redraw-stable; raw screen text is useful evidence but must not make one visible prompt turn into a new id on every redraw.
 
 ### Adapter Model and Delivery Order
 
@@ -130,6 +151,7 @@ The MVP focuses on `opencode` first, but the architecture must make future suppo
   - `t-acp opencode` launches the wrapped agent and keeps the user directly interactive
   - local keyboard, mouse, and resize events reach the agent correctly
   - the background service auto-starts if absent and registers the session exactly once
+  - auto-started background service remains available after a short-lived wrapped command exits
 - PTY lifecycle:
   - create session, launch child process, stream output, exit cleanly, and release resources
 - Virtual terminal parsing:
@@ -140,7 +162,8 @@ The MVP focuses on `opencode` first, but the architecture must make future suppo
   - list agent instances
   - target a specific instance directly
   - send input and invoke actions through instance-centric routes
-  - subscribe to instance state events
+  - fetch observation snapshots through HTTP
+  - verify internal WebSocket carries output, resize, and queued input
 - `opencode` adapter behavior:
   - detect permission prompts
   - approve permission and return to interactive state
@@ -155,7 +178,7 @@ The MVP focuses on `opencode` first, but the architecture must make future suppo
 
 ## Assumptions
 
-- MVP is Linux-first and does not promise macOS support initially.
+- MVP is Unix-first. macOS is part of the current local validation target; Linux remains an expected target through `portable-pty`.
 - The product shape is a foreground CLI wrapper plus background service, not a standalone full-screen manager TUI in the first release.
 - Public control semantics are instance-centric high-level actions first; raw terminal events remain an internal capability unless needed later.
 - `opencode` is the first production adapter; `codex` and `claude-code` are extension targets, not MVP commitments.

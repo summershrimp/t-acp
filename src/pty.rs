@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 pub struct ChildPty {
@@ -13,7 +14,7 @@ pub struct ChildPty {
 
 pub type SharedMasterPty = Arc<Mutex<Box<dyn MasterPty + Send>>>;
 
-pub fn spawn(command: &str, args: &[String], cwd: &str, size: PtySize) -> Result<ChildPty> {
+pub fn spawn(command: &str, args: &[String], cwd: &Path, size: PtySize) -> Result<ChildPty> {
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(size).context("failed to open PTY")?;
 
@@ -42,7 +43,7 @@ pub fn spawn(command: &str, args: &[String], cwd: &str, size: PtySize) -> Result
     })
 }
 
-fn build_command(command: &str, args: &[String], cwd: &str) -> CommandBuilder {
+fn build_command(command: &str, args: &[String], cwd: &Path) -> CommandBuilder {
     let mut command_builder = CommandBuilder::new(command);
     for arg in args {
         command_builder.arg(arg);
@@ -69,11 +70,8 @@ mod tests {
 
     #[test]
     fn build_command_sets_working_directory() {
-        let command = build_command(
-            "/bin/pwd",
-            &["-L".to_string()],
-            "/tmp/opencode/child working dir",
-        );
+        let cwd = Path::new("/tmp/opencode/child working dir");
+        let command = build_command("/bin/pwd", &["-L".to_string()], cwd);
 
         assert_eq!(command.get_argv()[0].to_string_lossy(), "/bin/pwd");
         assert_eq!(command.get_argv()[1].to_string_lossy(), "-L");
