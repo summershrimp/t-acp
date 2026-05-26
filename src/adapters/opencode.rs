@@ -320,17 +320,81 @@ fn extract_context_usage(plain: &str) -> Option<(String, u8)> {
 
 fn parse_context_usage_line(line: &str) -> Option<(String, u8)> {
     let trimmed = line.trim();
-    let open_paren = trimmed.find("(")?;
-    let percent_start = open_paren + 1;
-    let percent_end = trimmed[percent_start..].find("%)")? + percent_start;
-    let context_window = trimmed[..open_paren].trim();
-
-    if context_window.is_empty() {
+    if trimmed.is_empty()
+        || trimmed.contains("[Pasted")
+        || trimmed.contains("\":")
+        || trimmed.contains('{')
+        || trimmed.contains('}')
+    {
         return None;
     }
 
-    let context_usage_percent = trimmed[percent_start..percent_end].trim().parse().ok()?;
-    Some((context_window.to_string(), context_usage_percent))
+    let percent_end = trimmed.rfind("%)")?;
+    let open_paren = trimmed[..percent_end].rfind('(')?;
+    let percent_start = open_paren + 1;
+    let context_window = trimmed[..open_paren]
+        .split_whitespace()
+        .rev()
+        .find_map(normalize_context_window_token)?;
+
+    let context_usage_percent: u8 = trimmed[percent_start..percent_end].trim().parse().ok()?;
+
+    if context_usage_percent > 100 {
+        return None;
+    }
+
+    Some((context_window, context_usage_percent))
+}
+
+fn normalize_context_window_token(token: &str) -> Option<String> {
+    let candidate = token.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '"' | '\'' | ',' | ';' | ':' | '[' | ']' | '(' | ')' | '{' | '}'
+        )
+    });
+
+    if looks_like_context_window_token(candidate) {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
+
+fn looks_like_context_window_token(token: &str) -> bool {
+    let mut chars = token.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    if !first.is_ascii_digit() {
+        return false;
+    }
+
+    let mut saw_digit = true;
+    let mut saw_decimal = false;
+    let mut saw_unit = false;
+
+    for ch in chars {
+        if ch.is_ascii_digit() {
+            saw_digit = true;
+            continue;
+        }
+
+        if ch == '.' && !saw_decimal && !saw_unit {
+            saw_decimal = true;
+            continue;
+        }
+
+        if matches!(ch, 'K' | 'M' | 'G' | 'k' | 'm' | 'g') && saw_digit && !saw_unit {
+            saw_unit = true;
+            continue;
+        }
+
+        return false;
+    }
+
+    saw_digit && saw_unit
 }
 
 fn strip_ansi(input: &str) -> String {
@@ -431,8 +495,23 @@ mod tests {
 
     #[test]
     fn extracts_context_usage_metadata() {
-        let observation =
-            OpencodeAdapter.observe("Prompt\n42.6K (21%)  ctrl+p commands\n".as_bytes());
+        let observation = OpencodeAdapter
+            .observe("Prompt\n■■■⬝⬝⬝⬝⬝  esc interrupt  42.6K (21%)  ctrl+p commands\n".as_bytes());
+
+        assert_eq!(observation.current_context_window.as_deref(), Some("42.6K"));
+        assert_eq!(observation.current_context_usage_percent, Some(21));
+    }
+
+    #[test]
+    fn ignores_pasted_context_usage_lines() {
+        let observation = OpencodeAdapter.observe(
+            concat!(
+                "Prompt\n",
+                "42.6K (21%)  ctrl+p commands\n",
+                "[Pasted ~1 \"current_context_window\":\"■■■⬝⬝⬝⬝⬝  esc interrupt  59.2K (29%)\"\n",
+            )
+            .as_bytes(),
+        );
 
         assert_eq!(observation.current_context_window.as_deref(), Some("42.6K"));
         assert_eq!(observation.current_context_usage_percent, Some(21));
