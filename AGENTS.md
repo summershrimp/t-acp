@@ -43,7 +43,15 @@ Run `cargo test` before handing off changes. For daemon or PTY work, also run a 
 
 ## Commit & Pull Request Guidelines
 
-This repository has no established commit history yet. Use short imperative commit messages, such as `Add opencode adapter actions` or `Wire instance API routes`.
+Every completed task must end with a git commit.
+
+Use commit titles in the `type: title` format. Keep `title` specific and descriptive enough to summarize the work completed in that commit.
+
+Each commit message body must include:
+
+- the user's original input from the current agent interaction
+- a concise summary of the agent's analysis
+- a concise summary of the implementation or development work completed
 
 Pull requests should include a concise summary, notable behavior changes, and the exact verification commands run. For API changes, include example routes or payloads. For TUI/PTY changes, describe the manual smoke test and platform used.
 
