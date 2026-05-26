@@ -82,12 +82,24 @@ impl AgentStreamEvent {
         }
     }
 
+    pub fn instance_id(&self) -> &str {
+        match self {
+            Self::Snapshot { instance_id, .. }
+            | Self::StateChanged { instance_id, .. }
+            | Self::Exited { instance_id, .. } => instance_id,
+        }
+    }
+
     pub fn seq(&self) -> u64 {
         match self {
             Self::Snapshot { seq, .. }
             | Self::StateChanged { seq, .. }
             | Self::Exited { seq, .. } => *seq,
         }
+    }
+
+    pub fn event_id(&self) -> String {
+        format!("{}:{}", self.instance_id(), self.seq())
     }
 }
 

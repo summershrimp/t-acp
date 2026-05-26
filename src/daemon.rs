@@ -30,6 +30,7 @@ const INITIAL_EVENT_SEQ: u64 = 1;
 #[derive(Default)]
 struct Registry {
     instances: HashMap<String, AgentInstance>,
+    global_event_subscribers: Vec<mpsc::UnboundedSender<AgentStreamEvent>>,
 }
 
 struct AgentInstance {
@@ -73,6 +74,7 @@ pub async fn run(addr: &str) -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/agents", get(list_agents))
+        .route("/agents/events/stream", get(stream_all_agent_events))
         .route("/agents/{instance_id}", get(get_agent).delete(delete_agent))
         .route(
             "/agents/{instance_id}/events/stream",
@@ -171,6 +173,23 @@ async fn stream_agent_events(
         }));
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+async fn stream_all_agent_events(
+    State(registry): State<SharedRegistry>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    let rx = {
+        let mut registry = registry.lock().expect("registry lock poisoned");
+        let (tx, rx) = mpsc::unbounded_channel();
+        registry.global_event_subscribers.push(tx);
+        rx
+    };
+
+    let stream = stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|event| (Ok(event_to_sse(event)), rx))
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 async fn post_input(
@@ -341,7 +360,10 @@ async fn mark_exited(
     instance.interactive_kind = None;
     instance.exit_status = Some(request.status);
     instance.updated_at_ms = now_millis();
-    publish_if_changed(instance, previous_state, TrackedEventKind::Exited);
+    let event = publish_if_changed(instance, previous_state, TrackedEventKind::Exited);
+    if let Some(event) = event {
+        publish_global_event(&mut registry, event);
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -432,7 +454,11 @@ fn handle_ws_client_message(
             instance.screen_tail = render_screen_tail(&instance.screen);
             apply_observation(instance);
             instance.updated_at_ms = now_millis();
-            publish_if_changed(instance, previous_state, TrackedEventKind::StateChanged);
+            let event =
+                publish_if_changed(instance, previous_state, TrackedEventKind::StateChanged);
+            if let Some(event) = event {
+                publish_global_event(&mut registry, event);
+            }
         }
         InternalWsClientMessage::Resize { rows, cols } => {
             let mut registry = registry.lock().expect("registry lock poisoned");
@@ -445,7 +471,11 @@ fn handle_ws_client_message(
             instance.screen_tail = render_screen_tail(&instance.screen);
             apply_observation(instance);
             instance.updated_at_ms = now_millis();
-            publish_if_changed(instance, previous_state, TrackedEventKind::StateChanged);
+            let event =
+                publish_if_changed(instance, previous_state, TrackedEventKind::StateChanged);
+            if let Some(event) = event {
+                publish_global_event(&mut registry, event);
+            }
         }
         InternalWsClientMessage::Focus { focused } => {
             let mut registry = registry.lock().expect("registry lock poisoned");
@@ -456,7 +486,11 @@ fn handle_ws_client_message(
 
             instance.focused = focused;
             instance.updated_at_ms = now_millis();
-            publish_if_changed(instance, previous_state, TrackedEventKind::StateChanged);
+            let event =
+                publish_if_changed(instance, previous_state, TrackedEventKind::StateChanged);
+            if let Some(event) = event {
+                publish_global_event(&mut registry, event);
+            }
         }
     }
 }
@@ -612,11 +646,11 @@ fn publish_if_changed(
     instance: &mut AgentInstance,
     previous_state: AgentEventState,
     event_kind: TrackedEventKind,
-) {
+) -> Option<AgentStreamEvent> {
     let current_state = instance.event_state();
     let changed_fields = diff_event_state(&previous_state, &current_state);
     if changed_fields.is_empty() {
-        return;
+        return None;
     }
 
     let event = match event_kind {
@@ -639,6 +673,13 @@ fn publish_if_changed(
     instance.next_event_seq += 1;
     instance
         .event_subscribers
+        .retain(|subscriber| subscriber.send(event.clone()).is_ok());
+    Some(event)
+}
+
+fn publish_global_event(registry: &mut Registry, event: AgentStreamEvent) {
+    registry
+        .global_event_subscribers
         .retain(|subscriber| subscriber.send(event.clone()).is_ok());
 }
 
@@ -689,7 +730,7 @@ fn diff_event_state(previous: &AgentEventState, current: &AgentEventState) -> Ve
 }
 
 fn event_to_sse(event: AgentStreamEvent) -> Event {
-    let seq = event.seq().to_string();
+    let seq = event.event_id();
     let event_name = event.event_name();
     let data = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
 
@@ -848,11 +889,12 @@ mod tests {
         instance.blocking_reason = observation.blocking_reason;
         instance.need_interactive = observation.need_interactive;
         instance.interactive_kind = observation.interactive_kind;
-        publish_if_changed(
+        let event = publish_if_changed(
             &mut instance,
             previous_state,
             TrackedEventKind::StateChanged,
         );
+        assert!(event.is_some());
 
         match rx.try_recv() {
             Ok(AgentStreamEvent::StateChanged {
@@ -879,6 +921,65 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn publish_global_event_fans_out_to_global_subscribers() {
+        let mut registry = Registry::default();
+        let mut instance = sample_instance();
+        let previous_state = instance.event_state();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        registry.global_event_subscribers.push(tx);
+
+        instance.focused = false;
+        let event = publish_if_changed(
+            &mut instance,
+            previous_state,
+            TrackedEventKind::StateChanged,
+        )
+        .expect("event should be emitted");
+        publish_global_event(&mut registry, event);
+
+        match rx.try_recv() {
+            Ok(AgentStreamEvent::StateChanged {
+                instance_id,
+                changed_fields,
+                ..
+            }) => {
+                assert_eq!(instance_id, "instance-1");
+                assert_eq!(changed_fields, vec!["focused"]);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sse_event_id_includes_instance_and_sequence() {
+        let event = AgentStreamEvent::StateChanged {
+            seq: 7,
+            instance_id: "instance-1".to_string(),
+            ts_ms: 99,
+            changed_fields: vec!["focused".to_string()],
+            state: AgentEventState {
+                status: "ready".to_string(),
+                ui_mode: "input".to_string(),
+                blocking_reason: None,
+                current_agent: None,
+                current_model: None,
+                current_provider: None,
+                current_reasoning_effort: None,
+                current_context_window: None,
+                current_context_usage_percent: None,
+                need_interactive: false,
+                interactive_kind: None,
+                focused: true,
+                exit_status: None,
+            },
+        };
+
+        let sse = event_to_sse(event);
+        let rendered = format!("{sse:?}");
+        assert!(rendered.contains("instance-1:7"));
     }
 
     #[test]
