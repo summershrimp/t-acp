@@ -1,7 +1,7 @@
 use crate::adapters::{self, Adapter, AdapterError};
 use crate::api::{
-    ActionQueued, AgentList, AgentView, ErrorBody, ExitRequest, HealthResponse,
-    RegisterAgentRequest,
+    ActionQueued, AgentEventState, AgentList, AgentStreamEvent, AgentView, ErrorBody, ExitRequest,
+    HealthResponse, RegisterAgentRequest,
 };
 use crate::internal::{InternalWsClientMessage, InternalWsServerMessage};
 use crate::util::now_millis;
@@ -10,12 +10,14 @@ use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
-use futures_util::stream::SplitSink;
+use futures_util::stream::{self, SplitSink};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -23,6 +25,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 type SharedRegistry = Arc<Mutex<Registry>>;
+const INITIAL_EVENT_SEQ: u64 = 1;
 
 #[derive(Default)]
 struct Registry {
@@ -45,14 +48,24 @@ struct AgentInstance {
     current_reasoning_effort: Option<String>,
     current_context_window: Option<String>,
     current_context_usage_percent: Option<u8>,
+    need_interactive: bool,
+    interactive_kind: Option<String>,
     focused: bool,
     exit_status: Option<String>,
     screen: vt100::Parser,
     screen_tail: String,
     command_queue: VecDeque<Vec<u8>>,
     ws_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    next_event_seq: u64,
+    event_subscribers: Vec<mpsc::UnboundedSender<AgentStreamEvent>>,
     created_at_ms: u128,
     updated_at_ms: u128,
+}
+
+#[derive(Clone, Copy)]
+enum TrackedEventKind {
+    StateChanged,
+    Exited,
 }
 
 pub async fn run(addr: &str) -> Result<()> {
@@ -61,6 +74,10 @@ pub async fn run(addr: &str) -> Result<()> {
         .route("/health", get(health))
         .route("/agents", get(list_agents))
         .route("/agents/{instance_id}", get(get_agent).delete(delete_agent))
+        .route(
+            "/agents/{instance_id}/events/stream",
+            get(stream_agent_events),
+        )
         .route("/agents/{instance_id}/input", post(post_input))
         .route(
             "/agents/{instance_id}/actions/send-prompt",
@@ -130,6 +147,30 @@ async fn get_agent(
         .ok_or(ApiError::NotFound)?;
 
     Ok(Json(instance.view()))
+}
+
+async fn stream_agent_events(
+    State(registry): State<SharedRegistry>,
+    Path(instance_id): Path<String>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let (snapshot, rx) = {
+        let mut registry = registry.lock().expect("registry lock poisoned");
+        let instance = registry
+            .instances
+            .get_mut(&instance_id)
+            .ok_or(ApiError::NotFound)?;
+        let snapshot = instance.snapshot_event();
+        let (tx, rx) = mpsc::unbounded_channel();
+        instance.event_subscribers.push(tx);
+        (snapshot, rx)
+    };
+
+    let stream = stream::once(async move { Ok(event_to_sse(snapshot)) })
+        .chain(stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (Ok(event_to_sse(event)), rx))
+        }));
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 async fn post_input(
@@ -231,12 +272,16 @@ async fn register_agent(
         current_reasoning_effort: observation.current_reasoning_effort,
         current_context_window: observation.current_context_window,
         current_context_usage_percent: observation.current_context_usage_percent,
+        need_interactive: observation.need_interactive,
+        interactive_kind: observation.interactive_kind,
         focused: false,
         exit_status: None,
         screen: vt100::Parser::new(request.rows, request.cols, 2000),
         screen_tail: String::new(),
         command_queue: VecDeque::new(),
         ws_tx: None,
+        next_event_seq: INITIAL_EVENT_SEQ,
+        event_subscribers: Vec::new(),
         created_at_ms: now,
         updated_at_ms: now,
     };
@@ -287,12 +332,16 @@ async fn mark_exited(
         .instances
         .get_mut(&instance_id)
         .ok_or(ApiError::NotFound)?;
+    let previous_state = instance.event_state();
 
     instance.status = "exited".to_string();
     instance.ui_mode = "unknown".to_string();
     instance.blocking_reason = None;
+    instance.need_interactive = false;
+    instance.interactive_kind = None;
     instance.exit_status = Some(request.status);
     instance.updated_at_ms = now_millis();
+    publish_if_changed(instance, previous_state, TrackedEventKind::Exited);
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -377,31 +426,37 @@ fn handle_ws_client_message(
             let Some(instance) = registry.instances.get_mut(instance_id) else {
                 return;
             };
+            let previous_state = instance.event_state();
 
             instance.screen.process(&data);
             instance.screen_tail = render_screen_tail(&instance.screen);
             apply_observation(instance);
             instance.updated_at_ms = now_millis();
+            publish_if_changed(instance, previous_state, TrackedEventKind::StateChanged);
         }
         InternalWsClientMessage::Resize { rows, cols } => {
             let mut registry = registry.lock().expect("registry lock poisoned");
             let Some(instance) = registry.instances.get_mut(instance_id) else {
                 return;
             };
+            let previous_state = instance.event_state();
 
             instance.screen.screen_mut().set_size(rows, cols);
             instance.screen_tail = render_screen_tail(&instance.screen);
             apply_observation(instance);
             instance.updated_at_ms = now_millis();
+            publish_if_changed(instance, previous_state, TrackedEventKind::StateChanged);
         }
         InternalWsClientMessage::Focus { focused } => {
             let mut registry = registry.lock().expect("registry lock poisoned");
             let Some(instance) = registry.instances.get_mut(instance_id) else {
                 return;
             };
+            let previous_state = instance.event_state();
 
             instance.focused = focused;
             instance.updated_at_ms = now_millis();
+            publish_if_changed(instance, previous_state, TrackedEventKind::StateChanged);
         }
     }
 }
@@ -492,9 +547,39 @@ fn apply_observation(instance: &mut AgentInstance) {
     instance.current_reasoning_effort = observation.current_reasoning_effort;
     instance.current_context_window = observation.current_context_window;
     instance.current_context_usage_percent = observation.current_context_usage_percent;
+    instance.need_interactive = observation.need_interactive;
+    instance.interactive_kind = observation.interactive_kind;
 }
 
 impl AgentInstance {
+    fn event_state(&self) -> AgentEventState {
+        AgentEventState {
+            status: self.status.clone(),
+            ui_mode: self.ui_mode.clone(),
+            blocking_reason: self.blocking_reason.clone(),
+            current_agent: self.current_agent.clone(),
+            current_model: self.current_model.clone(),
+            current_provider: self.current_provider.clone(),
+            current_reasoning_effort: self.current_reasoning_effort.clone(),
+            current_context_window: self.current_context_window.clone(),
+            current_context_usage_percent: self.current_context_usage_percent,
+            need_interactive: self.need_interactive,
+            interactive_kind: self.interactive_kind.clone(),
+            focused: self.focused,
+            exit_status: self.exit_status.clone(),
+        }
+    }
+
+    fn snapshot_event(&self) -> AgentStreamEvent {
+        let event = AgentStreamEvent::Snapshot {
+            seq: self.next_event_seq.saturating_sub(1),
+            instance_id: self.id.clone(),
+            ts_ms: now_millis(),
+            state: self.event_state(),
+        };
+        event
+    }
+
     fn view(&self) -> AgentView {
         AgentView {
             id: self.id.clone(),
@@ -512,6 +597,8 @@ impl AgentInstance {
             current_reasoning_effort: self.current_reasoning_effort.clone(),
             current_context_window: self.current_context_window.clone(),
             current_context_usage_percent: self.current_context_usage_percent,
+            need_interactive: self.need_interactive,
+            interactive_kind: self.interactive_kind.clone(),
             focused: self.focused,
             exit_status: self.exit_status.clone(),
             created_at_ms: self.created_at_ms,
@@ -519,6 +606,94 @@ impl AgentInstance {
             screen_tail: self.screen_tail.clone(),
         }
     }
+}
+
+fn publish_if_changed(
+    instance: &mut AgentInstance,
+    previous_state: AgentEventState,
+    event_kind: TrackedEventKind,
+) {
+    let current_state = instance.event_state();
+    let changed_fields = diff_event_state(&previous_state, &current_state);
+    if changed_fields.is_empty() {
+        return;
+    }
+
+    let event = match event_kind {
+        TrackedEventKind::StateChanged => AgentStreamEvent::StateChanged {
+            seq: instance.next_event_seq,
+            instance_id: instance.id.clone(),
+            ts_ms: now_millis(),
+            changed_fields,
+            state: current_state,
+        },
+        TrackedEventKind::Exited => AgentStreamEvent::Exited {
+            seq: instance.next_event_seq,
+            instance_id: instance.id.clone(),
+            ts_ms: now_millis(),
+            changed_fields,
+            state: current_state,
+        },
+    };
+
+    instance.next_event_seq += 1;
+    instance
+        .event_subscribers
+        .retain(|subscriber| subscriber.send(event.clone()).is_ok());
+}
+
+fn diff_event_state(previous: &AgentEventState, current: &AgentEventState) -> Vec<String> {
+    let mut changed_fields = Vec::new();
+
+    if previous.status != current.status {
+        changed_fields.push("status".to_string());
+    }
+    if previous.ui_mode != current.ui_mode {
+        changed_fields.push("ui_mode".to_string());
+    }
+    if previous.blocking_reason != current.blocking_reason {
+        changed_fields.push("blocking_reason".to_string());
+    }
+    if previous.current_agent != current.current_agent {
+        changed_fields.push("current_agent".to_string());
+    }
+    if previous.current_model != current.current_model {
+        changed_fields.push("current_model".to_string());
+    }
+    if previous.current_provider != current.current_provider {
+        changed_fields.push("current_provider".to_string());
+    }
+    if previous.current_reasoning_effort != current.current_reasoning_effort {
+        changed_fields.push("current_reasoning_effort".to_string());
+    }
+    if previous.current_context_window != current.current_context_window {
+        changed_fields.push("current_context_window".to_string());
+    }
+    if previous.current_context_usage_percent != current.current_context_usage_percent {
+        changed_fields.push("current_context_usage_percent".to_string());
+    }
+    if previous.need_interactive != current.need_interactive {
+        changed_fields.push("need_interactive".to_string());
+    }
+    if previous.interactive_kind != current.interactive_kind {
+        changed_fields.push("interactive_kind".to_string());
+    }
+    if previous.focused != current.focused {
+        changed_fields.push("focused".to_string());
+    }
+    if previous.exit_status != current.exit_status {
+        changed_fields.push("exit_status".to_string());
+    }
+
+    changed_fields
+}
+
+fn event_to_sse(event: AgentStreamEvent) -> Event {
+    let seq = event.seq().to_string();
+    let event_name = event.event_name();
+    let data = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+
+    Event::default().id(seq).event(event_name).data(data)
 }
 
 #[derive(Debug, Error)]
@@ -560,5 +735,161 @@ impl IntoResponse for ApiError {
         };
 
         (status, Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapters::{AdapterObservation, InstanceStatus, UiMode};
+
+    fn sample_instance() -> AgentInstance {
+        AgentInstance {
+            id: "instance-1".to_string(),
+            agent_kind: "opencode".to_string(),
+            adapter: adapters::for_agent_kind("opencode"),
+            pid: Some(42),
+            cwd: "/tmp".to_string(),
+            command: "opencode".to_string(),
+            status: "ready".to_string(),
+            ui_mode: "input".to_string(),
+            blocking_reason: None,
+            current_agent: Some("Build".to_string()),
+            current_model: Some("gpt-5.4".to_string()),
+            current_provider: Some("GitHub Copilot".to_string()),
+            current_reasoning_effort: Some("high".to_string()),
+            current_context_window: Some("42.6K".to_string()),
+            current_context_usage_percent: Some(21),
+            need_interactive: false,
+            interactive_kind: None,
+            focused: true,
+            exit_status: None,
+            screen: vt100::Parser::new(24, 80, 2000),
+            screen_tail: String::new(),
+            command_queue: VecDeque::new(),
+            ws_tx: None,
+            next_event_seq: INITIAL_EVENT_SEQ,
+            event_subscribers: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn diff_event_state_reports_only_tracked_changes() {
+        let previous = AgentEventState {
+            status: "ready".to_string(),
+            ui_mode: "input".to_string(),
+            blocking_reason: None,
+            current_agent: Some("Build".to_string()),
+            current_model: Some("gpt-5.4".to_string()),
+            current_provider: Some("GitHub Copilot".to_string()),
+            current_reasoning_effort: Some("high".to_string()),
+            current_context_window: Some("42.6K".to_string()),
+            current_context_usage_percent: Some(21),
+            need_interactive: false,
+            interactive_kind: None,
+            focused: true,
+            exit_status: None,
+        };
+        let current = AgentEventState {
+            status: "blocked".to_string(),
+            ui_mode: "permission_prompt".to_string(),
+            blocking_reason: Some("permission".to_string()),
+            current_agent: Some("Build".to_string()),
+            current_model: Some("gpt-5.4".to_string()),
+            current_provider: Some("GitHub Copilot".to_string()),
+            current_reasoning_effort: Some("high".to_string()),
+            current_context_window: Some("42.6K".to_string()),
+            current_context_usage_percent: Some(21),
+            need_interactive: true,
+            interactive_kind: Some("permission".to_string()),
+            focused: false,
+            exit_status: None,
+        };
+
+        let changed_fields = diff_event_state(&previous, &current);
+
+        assert_eq!(
+            changed_fields,
+            vec![
+                "status",
+                "ui_mode",
+                "blocking_reason",
+                "need_interactive",
+                "interactive_kind",
+                "focused"
+            ]
+        );
+    }
+
+    #[test]
+    fn publish_if_changed_emits_state_change_event() {
+        let mut instance = sample_instance();
+        let previous_state = instance.event_state();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        instance.event_subscribers.push(tx);
+        let observation = AdapterObservation {
+            status: InstanceStatus::Blocked,
+            ui_mode: UiMode::PermissionPrompt,
+            blocking_reason: Some("permission".to_string()),
+            current_agent: Some("Build".to_string()),
+            current_model: Some("gpt-5.4".to_string()),
+            current_provider: Some("GitHub Copilot".to_string()),
+            current_reasoning_effort: Some("high".to_string()),
+            current_context_window: Some("42.6K".to_string()),
+            current_context_usage_percent: Some(21),
+            need_interactive: true,
+            interactive_kind: Some("permission".to_string()),
+        };
+
+        instance.status = observation.status.as_str().to_string();
+        instance.ui_mode = observation.ui_mode.as_str().to_string();
+        instance.blocking_reason = observation.blocking_reason;
+        instance.need_interactive = observation.need_interactive;
+        instance.interactive_kind = observation.interactive_kind;
+        publish_if_changed(
+            &mut instance,
+            previous_state,
+            TrackedEventKind::StateChanged,
+        );
+
+        match rx.try_recv() {
+            Ok(AgentStreamEvent::StateChanged {
+                seq,
+                changed_fields,
+                state,
+                ..
+            }) => {
+                assert_eq!(seq, INITIAL_EVENT_SEQ);
+                assert_eq!(state.status, "blocked");
+                assert_eq!(state.ui_mode, "permission_prompt");
+                assert!(state.need_interactive);
+                assert_eq!(state.interactive_kind.as_deref(), Some("permission"));
+                assert_eq!(
+                    changed_fields,
+                    vec![
+                        "status",
+                        "ui_mode",
+                        "blocking_reason",
+                        "need_interactive",
+                        "interactive_kind"
+                    ]
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn view_exposes_interactive_fields() {
+        let mut instance = sample_instance();
+        instance.need_interactive = true;
+        instance.interactive_kind = Some("permission".to_string());
+
+        let view = instance.view();
+
+        assert!(view.need_interactive);
+        assert_eq!(view.interactive_kind.as_deref(), Some("permission"));
     }
 }

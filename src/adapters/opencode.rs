@@ -103,6 +103,15 @@ fn observe_opencode(output_tail: &[u8]) -> AdapterObservation {
         );
     }
 
+    if looks_like_question_prompt(&lower) {
+        return build_observation(
+            InstanceStatus::Blocked,
+            UiMode::QuestionPrompt,
+            Some("question"),
+            &metadata,
+        );
+    }
+
     if looks_like_model_picker(&lower) {
         return build_observation(InstanceStatus::Ready, UiMode::ModelPicker, None, &metadata);
     }
@@ -148,6 +157,23 @@ fn looks_like_model_picker(lower: &str) -> bool {
         || lower.contains("choose model")
 }
 
+fn looks_like_question_prompt(lower: &str) -> bool {
+    let has_question = lower.contains('?')
+        || lower.contains("confirm")
+        || lower.contains("continue")
+        || lower.contains("choose")
+        || lower.contains("select");
+    let has_response_hint = lower.contains("yes")
+        || lower.contains("no")
+        || lower.contains("y/n")
+        || lower.contains("enter to continue")
+        || lower.contains("press enter")
+        || lower.contains("select an option")
+        || lower.contains("pick one");
+
+    has_question && has_response_hint
+}
+
 fn looks_busy(lower: &str) -> bool {
     lower.contains("thinking")
         || lower.contains("working")
@@ -161,6 +187,7 @@ fn build_observation(
     blocking_reason: Option<&str>,
     metadata: &RuntimeMetadata,
 ) -> AdapterObservation {
+    let interactive_kind = blocking_reason.map(str::to_string);
     AdapterObservation {
         status,
         ui_mode,
@@ -171,6 +198,8 @@ fn build_observation(
         current_reasoning_effort: metadata.current_reasoning_effort.clone(),
         current_context_window: metadata.current_context_window.clone(),
         current_context_usage_percent: metadata.current_context_usage_percent,
+        need_interactive: interactive_kind.is_some(),
+        interactive_kind,
     }
 }
 
@@ -356,6 +385,8 @@ mod tests {
         assert_eq!(observation.status, InstanceStatus::Blocked);
         assert_eq!(observation.ui_mode, UiMode::PermissionPrompt);
         assert_eq!(observation.blocking_reason.as_deref(), Some("permission"));
+        assert!(observation.need_interactive);
+        assert_eq!(observation.interactive_kind.as_deref(), Some("permission"));
     }
 
     #[test]
@@ -405,6 +436,17 @@ mod tests {
 
         assert_eq!(observation.current_context_window.as_deref(), Some("42.6K"));
         assert_eq!(observation.current_context_usage_percent, Some(21));
+    }
+
+    #[test]
+    fn detects_question_prompt_as_interactive() {
+        let observation = OpencodeAdapter.observe(b"Continue? yes / no");
+
+        assert_eq!(observation.status, InstanceStatus::Blocked);
+        assert_eq!(observation.ui_mode, UiMode::QuestionPrompt);
+        assert_eq!(observation.blocking_reason.as_deref(), Some("question"));
+        assert!(observation.need_interactive);
+        assert_eq!(observation.interactive_kind.as_deref(), Some("question"));
     }
 
     #[test]

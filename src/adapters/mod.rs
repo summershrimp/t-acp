@@ -16,6 +16,8 @@ pub struct AdapterObservation {
     pub current_reasoning_effort: Option<String>,
     pub current_context_window: Option<String>,
     pub current_context_usage_percent: Option<u8>,
+    pub need_interactive: bool,
+    pub interactive_kind: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +45,7 @@ pub enum UiMode {
     Normal,
     Input,
     PermissionPrompt,
+    QuestionPrompt,
     ModelPicker,
 }
 
@@ -53,6 +56,7 @@ impl UiMode {
             Self::Normal => "normal",
             Self::Input => "input",
             Self::PermissionPrompt => "permission_prompt",
+            Self::QuestionPrompt => "question_prompt",
             Self::ModelPicker => "model_picker",
         }
     }
@@ -180,6 +184,8 @@ fn starting_observation() -> AdapterObservation {
         current_reasoning_effort: None,
         current_context_window: None,
         current_context_usage_percent: None,
+        need_interactive: false,
+        interactive_kind: None,
     }
 }
 
@@ -198,6 +204,8 @@ fn observe_generic(output_tail: &[u8]) -> AdapterObservation {
         current_reasoning_effort: None,
         current_context_window: None,
         current_context_usage_percent: None,
+        need_interactive: false,
+        interactive_kind: None,
     }
 }
 
