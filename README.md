@@ -1,6 +1,6 @@
 # t-acp
 
-[中文](./README.zh.md)
+[中文](./README.zh.md) | [Architecture](./docs/architecture.md)
 
 `t-acp` is a local control layer for terminal-based TUI agents.
 
@@ -12,18 +12,20 @@ It lets you keep using interactive agents like `opencode`, `claude-code`, and `c
 
 - You want to keep the native TUI experience instead of converting an agent into a pure API workflow.
 - You want another local process to observe whether the agent is busy, blocked on a permission prompt, or running on a specific model.
-- You want a simple local interface to send prompts, approve permission dialogs, cycle models, or terminate an instance.
+- You want a simple local interface to send prompts, handle structured human-interaction prompts, cycle models, or terminate an instance.
 
 Its goal is not remote session hosting. It combines an interactive foreground terminal session with a programmable local control surface on the same machine.
+
+For the runtime model and extension boundaries, see [Architecture](./docs/architecture.md).
 
 ## What It Does
 
 - Runs the agent in the foreground and preserves the original PTY/TUI interaction model.
 - Ensures the local daemon is available and registers new instances automatically.
-- Exposes a local HTTP API to list instances, inspect details, send input, run actions, and terminate instances.
-- Maintains a recent terminal screen snapshot in `screen_tail` for external observation.
+- Exposes a local HTTP API to list instances, inspect details, send input, submit structured interactions, run actions, and terminate instances.
+- Maintains a recent terminal screen snapshot, raw PTY tail, observation events, and a local HTML observation plane.
 - Exposes runtime metadata such as current agent, model, provider, reasoning effort, context usage, and terminal focus state.
-- Provides specialized adapter behavior for `opencode`, including permission prompt detection, prompt injection, and model cycling shortcuts.
+- Provides specialized adapter behavior for `opencode`, including structured permission/question parsing, prompt injection, interaction submission, and model cycling shortcuts.
 - Falls back to a generic adapter for `claude-code`, `codex`, and unknown commands.
 
 ## Current Support
@@ -31,8 +33,10 @@ Its goal is not remote session hosting. It combines an interactive foreground te
 ### `opencode`
 
 - Detects permission prompts
+- Detects external-directory, doom-loop, and question interactions as structured `interaction_request` values
 - Uses bracketed paste for `send-prompt` and submits automatically
 - Supports `approve-permission` / `reject-permission`
+- Supports unified `POST /agents/{instance_id}/interaction` submissions for allow-once, allow-always, reject, option selection, and custom answers when available
 - Supports `previous-model` / `next-model`
 - Attempts to extract runtime metadata: agent, model, provider, reasoning effort, and context usage
 
@@ -122,7 +126,8 @@ When you run `t-acp <agent> ...`:
 2. If the daemon is not running, it starts one in the background.
 3. The agent runs in a PTY in the foreground.
 4. Screen output remains visible in your terminal and is also forwarded to the daemon.
-5. The daemon records instance metadata, status, recent screen contents, and any runtime metadata it can infer.
+5. Runtime PTY output, resize, focus, and queued input flow through the internal WebSocket at `/internal/agents/{instance_id}/ws`.
+6. The daemon records instance metadata, status, recent screen contents, raw PTY tail, observation events, structured interactions, and any runtime metadata it can infer.
 
 ## Common Usage
 
@@ -159,6 +164,21 @@ Approve an `opencode` permission prompt:
 ```bash
 curl -X POST \
   http://127.0.0.1:48974/agents/<instance_id>/actions/approve-permission
+```
+
+Submit the currently visible structured interaction:
+
+```bash
+curl -X POST \
+  -H 'content-type: application/json' \
+  -d '{"interaction_id":"<interaction_id>","option_key":"allow_once","custom_answer":null}' \
+  http://127.0.0.1:48974/agents/<instance_id>/interaction
+```
+
+Open the observation plane:
+
+```bash
+open http://127.0.0.1:48974/observe
 ```
 
 Cycle to the next model:
@@ -209,6 +229,34 @@ Example response:
 
 Returns details for a single instance.
 
+#### `GET /observe`
+
+Returns the zero-build local HTML observation plane. It lists registered agents, lets you select an instance, and shows the current screen, structured human interaction controls, event timeline, and raw PTY tail.
+
+The template is embedded from `assets/observe.html`; rebuild and restart the daemon after editing that file.
+
+#### `GET /agents/{instance_id}/observe`
+
+Returns the same observation plane with the given instance preselected.
+
+#### `GET /agents/{instance_id}/observations`
+
+Returns observation-plane JSON for one instance:
+
+- `agent`: the same object returned by `GET /agents/{instance_id}`
+- `screen`: the daemon's vt100 snapshot, including size, cursor, lines, and full text
+- `events`: recent observation events such as `pty_output_received`, `state_changed`, and `interaction_detected`
+- `raw_tail_hex`: recent raw PTY bytes as hexadecimal
+- `raw_tail_utf8_lossy`: recent raw PTY bytes decoded lossily as UTF-8
+
+#### `GET /agents/{instance_id}/events/stream`
+
+Streams state changes for one instance as Server-Sent Events.
+
+#### `GET /agents/events/stream`
+
+Streams state changes for all instances as Server-Sent Events.
+
 ### Write endpoints
 
 Every public write endpoint except `GET /health`, `GET /agents`, and `GET /agents/{instance_id}` returns `202 Accepted` on success:
@@ -257,6 +305,27 @@ Rejects a permission request.
 - For `opencode`: only succeeds when a permission prompt is currently visible
 - The current implementation sends `Esc`
 
+#### `POST /agents/{instance_id}/interaction`
+
+Submits the currently visible structured human interaction. The daemon rejects stale submissions with `409 stale_interaction` if `interaction_id` no longer matches the visible `interaction_request.id`.
+
+Request body:
+
+```json
+{
+  "interaction_id": "opencode-external_directory-...",
+  "option_key": "allow_once",
+  "custom_answer": null
+}
+```
+
+Rules:
+
+- Provide exactly one of `option_key` or `custom_answer`.
+- Permission interactions support option keys or actions such as `allow_once`, `allow_persist`, and `deny`.
+- Question interactions can submit an option key; if `custom_answer_allowed` is `true`, they can also submit `custom_answer`.
+- `interaction_request.id` is semantic and redraw-stable; it does not include raw screen noise, cursor position, or spinner frames.
+
 #### `POST /agents/{instance_id}/actions/previous-model`
 
 Cycles to the previous model.
@@ -303,6 +372,9 @@ The objects returned by `GET /agents` and `GET /agents/{instance_id}` look like 
   "current_reasoning_effort": "high",
   "current_context_window": "42.6K",
   "current_context_usage_percent": 21,
+  "need_interactive": false,
+  "interactive_kind": null,
+  "interaction_request": null,
   "focused": true,
   "exit_status": null,
   "created_at_ms": 1716620000000,
@@ -324,8 +396,41 @@ Key fields:
 - `current_reasoning_effort`: current reasoning level, such as `high`
 - `current_context_window`: current context size, such as `42.6K`
 - `current_context_usage_percent`: current context usage percentage, such as `21`
+- `need_interactive`: whether the adapter believes human input is needed
+- `interactive_kind`: high-level interaction kind, such as `permission` or `question`
+- `interaction_request`: structured interaction payload rendered by the observation plane when available
 - `focused`: whether the outer terminal is currently focused
 - `screen_tail`: recent terminal screen text maintained by the daemon for observation and adapter heuristics
+
+Example `interaction_request`:
+
+```json
+{
+  "id": "opencode-question-7b7c1a2f59c770dd",
+  "kind": "question",
+  "source": "opencode",
+  "title": "Question",
+  "subject": null,
+  "prompt": "Which implementation path should I take?",
+  "options": [
+    {
+      "key": "1",
+      "label": "Small focused patch",
+      "selected": true,
+      "action": null
+    }
+  ],
+  "custom_answer_allowed": true,
+  "confidence": 90,
+  "evidence": [
+    {
+      "label": "source",
+      "value": "pty_screen"
+    }
+  ],
+  "raw": "...recent interaction screen block..."
+}
+```
 
 ## Focus State
 
@@ -347,14 +452,16 @@ Common errors include:
 - `409 process_exited`: the instance has already exited and can no longer accept actions
 - `409 ui_not_detected`: the adapter requires a UI state that is not currently visible, for example no permission prompt is present
 - `400 bad_request`: the request body is invalid, such as an empty prompt
+- `409 stale_interaction`: the submitted interaction is no longer visible or its id changed
 - `501 unsupported_action`: the current adapter does not support that action yet
 
 ## Current Limitations
 
 - The daemon registry is in-memory only, so instance data is not persisted across daemon restarts
 - `screen_tail` is based on terminal screen contents, not a complete output log
+- Observation-plane raw PTY tail and events are in-memory ring buffers and do not survive daemon restarts
 - `switch-model` is not implemented yet
-- A remote `resize` API is not wired yet
+- There is no public remote resize API; wrapper-local `SIGWINCH` resize is synchronized through the internal WebSocket
 - `focused` depends on proper focus event forwarding from the terminal and any multiplexer such as `tmux`
 - Adapter state detection is heuristic; `opencode` UI detection can still misclassify some screens
 - The service listens on loopback by default and has no authentication; do not expose it directly to the public internet
@@ -389,6 +496,12 @@ curl -X POST \
   http://127.0.0.1:49001/agents/<instance_id>/input
 ```
 
+Open the observation plane:
+
+```bash
+open http://127.0.0.1:49001/observe
+```
+
 ## Project Structure
 
 ```text
@@ -398,11 +511,14 @@ src/daemon.rs            local HTTP control service and instance registry
 src/adapters/            adapter trait and implementations
 src/adapters/generic.rs  generic adapter
 src/adapters/opencode.rs opencode adapter and metadata extraction
+src/interactions.rs      interaction ids and submission validation
 src/pty.rs               Unix PTY spawn and resize support
 src/http.rs              daemon client
 src/api.rs               HTTP request and response structures
 src/internal.rs          internal WebSocket messages between wrapper and daemon
 src/util.rs              small utility helpers
+assets/observe.html      embedded observation-plane HTML template
+docs/architecture.md     current architecture guide
 plans/                   design and implementation notes
 ```
 
@@ -411,7 +527,7 @@ plans/                   design and implementation notes
 The following endpoints are primarily for internal wrapper-daemon communication and are not intended for external callers:
 
 - `POST /internal/agents/register`
-- `GET /internal/agents/{instance_id}/ws` for WebSocket upgrade
+- `WebSocket /internal/agents/{instance_id}/ws`
 - `POST /internal/agents/{instance_id}/exit`
 
 The wrapper and daemon currently use `/internal/agents/{instance_id}/ws` to carry:
@@ -421,3 +537,5 @@ The wrapper and daemon currently use `/internal/agents/{instance_id}/ws` to carr
 - Queued commands from the daemon back to the wrapper
 
 In other words, the runtime data plane now goes through the internal WebSocket. Internal HTTP is mainly used for registration and exit reporting.
+
+Do not add internal HTTP fallback endpoints for output, resize, or command polling unless compatibility explicitly requires it.
