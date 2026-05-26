@@ -320,30 +320,61 @@ fn extract_context_usage(plain: &str) -> Option<(String, u8)> {
 
 fn parse_context_usage_line(line: &str) -> Option<(String, u8)> {
     let trimmed = line.trim();
-    if trimmed.is_empty()
-        || trimmed.contains("[Pasted")
-        || trimmed.contains("\":")
-        || trimmed.contains('{')
-        || trimmed.contains('}')
-    {
+    if trimmed.is_empty() {
         return None;
     }
 
-    let percent_end = trimmed.rfind("%)")?;
-    let open_paren = trimmed[..percent_end].rfind('(')?;
-    let percent_start = open_paren + 1;
-    let context_window = trimmed[..open_paren]
-        .split_whitespace()
-        .rev()
-        .find_map(normalize_context_window_token)?;
+    let mut candidate = None;
 
-    let context_usage_percent: u8 = trimmed[percent_start..percent_end].trim().parse().ok()?;
+    for (open_paren, ch) in trimmed.char_indices() {
+        if ch != '(' || is_within_quotes(trimmed, open_paren) {
+            continue;
+        }
 
-    if context_usage_percent > 100 {
+        let Some(context_window) = previous_context_window_token(trimmed, open_paren) else {
+            continue;
+        };
+        let rest = &trimmed[open_paren + 1..];
+        let Some(close_paren) = rest.find(')') else {
+            continue;
+        };
+        let percent_text = rest[..close_paren].trim();
+        let Some(percent_text) = percent_text.strip_suffix('%') else {
+            continue;
+        };
+        let Ok(context_usage_percent) = percent_text.trim().parse::<u8>() else {
+            continue;
+        };
+
+        if context_usage_percent > 100 {
+            continue;
+        }
+
+        candidate = Some((context_window, context_usage_percent));
+    }
+
+    candidate
+}
+
+fn previous_context_window_token(line: &str, open_paren: usize) -> Option<String> {
+    let prefix = &line[..open_paren];
+    let bytes = prefix.as_bytes();
+    let mut end = prefix.len();
+
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+
+    if end == 0 {
         return None;
     }
 
-    Some((context_window, context_usage_percent))
+    let mut start = end;
+    while start > 0 && !bytes[start - 1].is_ascii_whitespace() {
+        start -= 1;
+    }
+
+    normalize_context_window_token(&prefix[start..end])
 }
 
 fn normalize_context_window_token(token: &str) -> Option<String> {
@@ -395,6 +426,36 @@ fn looks_like_context_window_token(token: &str) -> bool {
     }
 
     saw_digit && saw_unit
+}
+
+fn is_within_quotes(line: &str, index: usize) -> bool {
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+
+    for (offset, ch) in line.char_indices() {
+        if offset >= index {
+            break;
+        }
+
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+
+        match ch {
+            '\'' if !in_double_quote => in_single_quote = !in_single_quote,
+            '"' if !in_single_quote => in_double_quote = !in_double_quote,
+            _ => {}
+        }
+    }
+
+    in_single_quote || in_double_quote
 }
 
 fn strip_ansi(input: &str) -> String {
@@ -503,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn ignores_pasted_context_usage_lines() {
+    fn ignores_quoted_context_usage_matches() {
         let observation = OpencodeAdapter.observe(
             concat!(
                 "Prompt\n",
