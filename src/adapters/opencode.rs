@@ -184,23 +184,28 @@ fn require_permission_prompt(output_tail: &[u8]) -> Result<(), AdapterError> {
 }
 
 fn looks_like_permission_prompt(lower: &str) -> bool {
-    let has_permission_word = lower.contains("permission")
-        || lower.contains("approve")
-        || lower.contains("approval")
-        || lower.contains("allow")
-        || lower.contains("deny");
+    let has_prompt_marker = lower.contains("permission required")
+        || lower.contains("permission request")
+        || lower.contains("requires permission")
+        || lower.contains("approval required")
+        || lower.contains("do you want to proceed")
+        || lower.contains("access external directory")
+        || lower.contains("access external file")
+        || lower.contains("access outside");
+    let has_permission_word =
+        lower.contains("permission") || lower.contains("approve") || lower.contains("approval");
     let has_action_word = lower.contains("tool")
         || lower.contains("command")
         || lower.contains("access")
         || lower.contains("external directory")
         || lower.contains("execute")
-        || lower.contains("run")
-        || lower.contains("edit")
-        || lower.contains("write");
+        || lower.contains("run");
     let has_choice_pair = (lower.contains("allow") || lower.contains("approve"))
         && (lower.contains("deny") || lower.contains("reject"));
 
-    (has_permission_word && has_action_word) || has_choice_pair
+    has_prompt_marker
+        || (has_action_word && has_choice_pair)
+        || (has_permission_word && has_choice_pair)
 }
 
 fn parse_permission(plain: &str) -> Option<ParsedPermission> {
@@ -218,7 +223,6 @@ fn parse_permission(plain: &str) -> Option<ParsedPermission> {
     let has_explicit_prompt = lower.contains("permission")
         || lower.contains("approval")
         || lower.contains("approve")
-        || lower.contains("allow")
         || lower.contains("deny")
         || lower.contains("reject");
     let has_permission_context =
@@ -230,7 +234,9 @@ fn parse_permission(plain: &str) -> Option<ParsedPermission> {
 
     let has_explicit_decision_prompt =
         has_explicit_prompt && question.is_some() && has_decision_option;
-    if !has_permission_context && !has_explicit_decision_prompt {
+    let has_button_decisions = has_permission_context && has_decision_option;
+    let has_context_without_options = has_permission_context && options.is_empty();
+    if !has_button_decisions && !has_context_without_options && !has_explicit_decision_prompt {
         return None;
     }
 
@@ -259,6 +265,7 @@ fn permission_to_interaction(plain: &str, permission: &ParsedPermission) -> Inte
         options: permission
             .options
             .iter()
+            .filter(|option| option.decision != "unknown")
             .map(|option| InteractionOption {
                 key: option.key.clone(),
                 label: option.label.clone(),
@@ -296,6 +303,7 @@ fn permission_interaction_from_plain(plain: &str) -> InteractionRequest {
         prompt: prompt.clone(),
         options: options
             .iter()
+            .filter(|option| option.decision != "unknown")
             .map(|option| InteractionOption {
                 key: option.key.clone(),
                 label: option.label.clone(),
@@ -399,9 +407,19 @@ fn question_evidence(
 }
 
 fn extract_patterns(lines: &[String]) -> Option<String> {
+    let mut found_header = false;
     let patterns = lines
         .iter()
-        .filter_map(|line| line.strip_prefix("- ").map(str::trim))
+        .filter_map(|line| {
+            if line.eq_ignore_ascii_case("patterns") {
+                found_header = true;
+                return None;
+            }
+            if found_header {
+                return line.strip_prefix("- ").map(str::trim);
+            }
+            None
+        })
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
     if patterns.is_empty() {
@@ -1363,6 +1381,43 @@ Select model
 
         let observation = OpencodeAdapter.observe(screen.as_bytes());
         assert_ne!(observation.ui_mode, UiMode::PermissionPrompt);
+        assert!(observation.interaction_request.is_none());
+    }
+
+    #[test]
+    fn ignores_permission_configuration_summary() {
+        let screen = r#"
+让我读取主要的配置文件 opencode.json。
+
+→ Read ~/.config/opencode/opencode.json
+
+Thought: 用户要求查看 ~/ 下的 opencode 全局配置。我已经读取了主配置文件 ~/.config/opencode/opencode.json。
+
+配置包含：
+1. 插件：superpowers-lite
+2. Provider: github-copilot，配置了多个模型：
+   - claude-opus-4.7 (200k)
+   - claude-sonnet-4.6 (200k)
+   - gpt-5.4 (360k)
+   - gpt-5.5 (360k)
+   - gemini-3.1-pro-preview
+3. Agents: 定义了多个 subagent:
+   - implementer (gpt-5.4 high)
+   - spec-reviewer (gpt-5.4)
+4. 权限: 全局权限配置
+5. snapshot: false
+
+这是一个小任务，已经完成。我应该简洁地总结配置内容。
+
+~/.config/opencode/opencode.json 配置概览：
+全局权限: edit/write/bash/webfetch/websearch/skill/todowrite/todoread 均为 allow
+"#;
+
+        let observation = OpencodeAdapter.observe(screen.as_bytes());
+        assert_eq!(observation.status, InstanceStatus::Ready);
+        assert_eq!(observation.ui_mode, UiMode::Input);
+        assert!(!observation.need_interactive);
+        assert_ne!(observation.blocking_reason.as_deref(), Some("permission"));
         assert!(observation.interaction_request.is_none());
     }
 
