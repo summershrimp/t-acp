@@ -41,7 +41,7 @@ pub fn run(mut args: Vec<String>, addr: &str) -> Result<u8> {
     );
     let command = build_command_string(&agent, &args);
     let initial_size = current_pty_size();
-    let mut child_pty = pty::spawn(&agent, &args, initial_size)
+    let mut child_pty = pty::spawn(&agent, &args, &cwd, initial_size)
         .with_context(|| format!("failed to launch {agent}"))?;
 
     register_instance(
