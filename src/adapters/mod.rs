@@ -1,6 +1,8 @@
 mod generic;
 mod opencode;
 
+use crate::api::InteractionRequest;
+use crate::interactions::InteractionSubmission;
 use generic::GenericAdapter;
 use opencode::OpencodeAdapter;
 use thiserror::Error;
@@ -18,6 +20,7 @@ pub struct AdapterObservation {
     pub current_context_usage_percent: Option<u8>,
     pub need_interactive: bool,
     pub interactive_kind: Option<String>,
+    pub interaction_request: Option<InteractionRequest>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,6 +124,16 @@ pub trait Adapter: Sync {
         Ok(b"\x1b".to_vec())
     }
 
+    fn submit_interaction(
+        &self,
+        _interaction: &InteractionRequest,
+        _submission: &InteractionSubmission,
+    ) -> Result<Vec<u8>, AdapterError> {
+        Err(AdapterError::UnsupportedAction(
+            "interaction submission needs an adapter-specific implementation".to_string(),
+        ))
+    }
+
     fn previous_model(&self) -> Result<Vec<u8>, AdapterError> {
         Err(AdapterError::UnsupportedAction(
             "previous-model needs an adapter-specific implementation".to_string(),
@@ -186,6 +199,7 @@ fn starting_observation() -> AdapterObservation {
         current_context_usage_percent: None,
         need_interactive: false,
         interactive_kind: None,
+        interaction_request: None,
     }
 }
 
@@ -206,6 +220,7 @@ fn observe_generic(output_tail: &[u8]) -> AdapterObservation {
         current_context_usage_percent: None,
         need_interactive: false,
         interactive_kind: None,
+        interaction_request: None,
     }
 }
 

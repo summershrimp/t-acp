@@ -24,6 +24,7 @@ pub struct AgentView {
     pub current_context_usage_percent: Option<u8>,
     pub need_interactive: bool,
     pub interactive_kind: Option<String>,
+    pub interaction_request: Option<InteractionRequest>,
     pub focused: bool,
     pub exit_status: Option<String>,
     pub created_at_ms: u128,
@@ -103,9 +104,78 @@ impl AgentStreamEvent {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+pub struct InteractionRequest {
+    pub id: String,
+    pub kind: String,
+    pub source: String,
+    pub title: Option<String>,
+    pub subject: Option<String>,
+    pub prompt: Option<String>,
+    pub options: Vec<InteractionOption>,
+    pub custom_answer_allowed: bool,
+    pub confidence: u8,
+    pub evidence: Vec<InteractionEvidence>,
+    pub raw: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+pub struct InteractionOption {
+    pub key: String,
+    pub label: String,
+    pub selected: bool,
+    pub action: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+pub struct InteractionEvidence {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SubmitInteractionRequest {
+    pub interaction_id: String,
+    pub option_key: Option<String>,
+    pub custom_answer: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AgentList {
     pub agents: Vec<AgentView>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ObservationView {
+    pub agent: AgentView,
+    pub screen: ScreenSnapshot,
+    pub events: Vec<ObservationEvent>,
+    pub raw_tail_hex: String,
+    pub raw_tail_utf8_lossy: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ScreenSnapshot {
+    pub rows: u16,
+    pub cols: u16,
+    pub cursor: CursorPosition,
+    pub lines: Vec<String>,
+    pub text: String,
+    pub updated_at_ms: u128,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CursorPosition {
+    pub row: u16,
+    pub col: u16,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ObservationEvent {
+    pub seq: u64,
+    pub at_ms: u128,
+    pub kind: String,
+    pub message: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

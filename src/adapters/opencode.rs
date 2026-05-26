@@ -1,6 +1,8 @@
 use super::{
     Adapter, AdapterError, AdapterObservation, InstanceStatus, UiMode, starting_observation,
 };
+use crate::api::{InteractionEvidence, InteractionOption, InteractionRequest};
+use crate::interactions::{InteractionSubmission, push_evidence, with_stable_id};
 
 const PERMISSION_PROMPT_NOT_VISIBLE: &str = "opencode permission prompt is not visible";
 const KNOWN_PROVIDERS: &[&str] = &[
@@ -33,6 +35,23 @@ struct RuntimeMetadata {
     current_context_usage_percent: Option<u8>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedPermission {
+    title: Option<String>,
+    subject: Option<String>,
+    question: Option<String>,
+    options: Vec<ParsedOption>,
+    raw: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedOption {
+    key: String,
+    label: String,
+    selected: bool,
+    decision: String,
+}
+
 impl Adapter for OpencodeAdapter {
     fn canonical_agent_kind(&self) -> &'static str {
         "opencode"
@@ -58,6 +77,14 @@ impl Adapter for OpencodeAdapter {
         bytes.extend_from_slice(prompt);
         bytes.extend_from_slice(b"\x1b[201~\r");
         Ok(bytes)
+    }
+
+    fn submit_interaction(
+        &self,
+        interaction: &InteractionRequest,
+        submission: &InteractionSubmission,
+    ) -> Result<Vec<u8>, AdapterError> {
+        submit_opencode_interaction(interaction, submission)
     }
 
     fn approve_permission(&self, output_tail: &[u8]) -> Result<Vec<u8>, AdapterError> {
@@ -93,13 +120,29 @@ fn observe_opencode(output_tail: &[u8]) -> AdapterObservation {
     let plain = strip_ansi(&String::from_utf8_lossy(output_tail));
     let lower = plain.to_ascii_lowercase();
     let metadata = extract_runtime_metadata(&plain);
+    let permission = parse_permission(&plain);
 
-    if looks_like_permission_prompt(&lower) {
+    if permission.is_some() || looks_like_permission_prompt(&lower) {
+        let interaction_request = permission
+            .as_ref()
+            .map(|permission| permission_to_interaction(&plain, permission))
+            .or_else(|| Some(permission_interaction_from_plain(&plain)));
         return build_observation(
             InstanceStatus::Blocked,
             UiMode::PermissionPrompt,
             Some("permission"),
             &metadata,
+            interaction_request,
+        );
+    }
+
+    if let Some(question_request) = parse_question_request(&plain) {
+        return build_observation(
+            InstanceStatus::Blocked,
+            UiMode::QuestionPrompt,
+            Some("question"),
+            &metadata,
+            Some(question_request),
         );
     }
 
@@ -109,18 +152,25 @@ fn observe_opencode(output_tail: &[u8]) -> AdapterObservation {
             UiMode::QuestionPrompt,
             Some("question"),
             &metadata,
+            None,
         );
     }
 
     if looks_like_model_picker(&lower) {
-        return build_observation(InstanceStatus::Ready, UiMode::ModelPicker, None, &metadata);
+        return build_observation(
+            InstanceStatus::Ready,
+            UiMode::ModelPicker,
+            None,
+            &metadata,
+            None,
+        );
     }
 
     if looks_busy(&lower) {
-        return build_observation(InstanceStatus::Busy, UiMode::Normal, None, &metadata);
+        return build_observation(InstanceStatus::Busy, UiMode::Normal, None, &metadata, None);
     }
 
-    build_observation(InstanceStatus::Ready, UiMode::Input, None, &metadata)
+    build_observation(InstanceStatus::Ready, UiMode::Input, None, &metadata, None)
 }
 
 fn require_permission_prompt(output_tail: &[u8]) -> Result<(), AdapterError> {
@@ -141,6 +191,8 @@ fn looks_like_permission_prompt(lower: &str) -> bool {
         || lower.contains("deny");
     let has_action_word = lower.contains("tool")
         || lower.contains("command")
+        || lower.contains("access")
+        || lower.contains("external directory")
         || lower.contains("execute")
         || lower.contains("run")
         || lower.contains("edit")
@@ -149,6 +201,556 @@ fn looks_like_permission_prompt(lower: &str) -> bool {
         && (lower.contains("deny") || lower.contains("reject"));
 
     (has_permission_word && has_action_word) || has_choice_pair
+}
+
+fn parse_permission(plain: &str) -> Option<ParsedPermission> {
+    let lines = clean_lines(plain);
+    if lines.is_empty() {
+        return None;
+    }
+
+    let options = parse_options(&lines);
+    let question = find_question(&lines);
+    let lower = plain.to_ascii_lowercase();
+    let has_decision_option = options
+        .iter()
+        .any(|option| option.decision.as_str() != "unknown");
+    let has_explicit_prompt = lower.contains("permission")
+        || lower.contains("approval")
+        || lower.contains("approve")
+        || lower.contains("allow")
+        || lower.contains("deny")
+        || lower.contains("reject");
+    let has_permission_context =
+        looks_like_permission_prompt(&lower) || lower.contains("do you want to proceed");
+
+    if options.is_empty() && !has_permission_context {
+        return None;
+    }
+
+    let has_explicit_decision_prompt =
+        has_explicit_prompt && question.is_some() && has_decision_option;
+    if !has_permission_context && !has_explicit_decision_prompt {
+        return None;
+    }
+
+    let title = find_title(&lines);
+    let subject = find_subject(&lines, title.as_deref(), question.as_deref());
+    let raw = relevant_raw_block(&lines);
+
+    Some(ParsedPermission {
+        title,
+        subject,
+        question,
+        options,
+        raw,
+    })
+}
+
+fn permission_to_interaction(plain: &str, permission: &ParsedPermission) -> InteractionRequest {
+    let kind = classify_permission_interaction_kind(plain).to_string();
+    with_stable_id(InteractionRequest {
+        id: String::new(),
+        kind: kind.clone(),
+        source: "opencode".to_string(),
+        title: permission.title.clone(),
+        subject: permission.subject.clone(),
+        prompt: permission.question.clone(),
+        options: permission
+            .options
+            .iter()
+            .map(|option| InteractionOption {
+                key: option.key.clone(),
+                label: option.label.clone(),
+                selected: option.selected,
+                action: Some(option.decision.clone()),
+            })
+            .collect(),
+        custom_answer_allowed: false,
+        confidence: permission_confidence(permission.options.len(), permission.subject.is_some()),
+        evidence: permission_evidence(
+            &kind,
+            permission.title.as_deref(),
+            permission.subject.as_deref(),
+            permission.question.as_deref(),
+            &permission.options,
+            &clean_lines(plain),
+        ),
+        raw: permission.raw.clone(),
+    })
+}
+
+fn permission_interaction_from_plain(plain: &str) -> InteractionRequest {
+    let lines = clean_lines(plain);
+    let title = find_title(&lines);
+    let prompt = find_question(&lines);
+    let subject = find_subject(&lines, None, prompt.as_deref());
+    let options = parse_options(&lines);
+    let kind = classify_permission_interaction_kind(plain).to_string();
+    with_stable_id(InteractionRequest {
+        id: String::new(),
+        kind: kind.clone(),
+        source: "opencode".to_string(),
+        title: title.clone(),
+        subject: subject.clone(),
+        prompt: prompt.clone(),
+        options: options
+            .iter()
+            .map(|option| InteractionOption {
+                key: option.key.clone(),
+                label: option.label.clone(),
+                selected: option.selected,
+                action: Some(option.decision.clone()),
+            })
+            .collect(),
+        custom_answer_allowed: false,
+        confidence: permission_confidence(options.len(), subject.is_some()),
+        evidence: permission_evidence(
+            &kind,
+            title.as_deref(),
+            subject.as_deref(),
+            prompt.as_deref(),
+            &options,
+            &lines,
+        ),
+        raw: relevant_raw_block(&lines),
+    })
+}
+
+fn classify_permission_interaction_kind(plain: &str) -> &'static str {
+    let lower = plain.to_ascii_lowercase();
+    if lower.contains("external_directory")
+        || lower.contains("external directory")
+        || (lower.contains("outside")
+            && (lower.contains("working directory")
+                || lower.contains("workspace")
+                || lower.contains("project")))
+    {
+        return "external_directory";
+    }
+
+    if lower.contains("doom_loop")
+        || lower.contains("doom loop")
+        || (lower.contains("same tool") && lower.contains("repeat"))
+        || (lower.contains("repeated") && lower.contains("tool"))
+    {
+        return "doom_loop";
+    }
+
+    "permission"
+}
+
+fn permission_confidence(option_count: usize, has_subject: bool) -> u8 {
+    match (option_count >= 2, has_subject) {
+        (true, true) => 95,
+        (true, false) => 88,
+        (false, true) => 74,
+        (false, false) => 65,
+    }
+}
+
+fn permission_evidence(
+    kind: &str,
+    title: Option<&str>,
+    subject: Option<&str>,
+    prompt: Option<&str>,
+    options: &[ParsedOption],
+    lines: &[String],
+) -> Vec<InteractionEvidence> {
+    let mut evidence = Vec::new();
+    push_evidence(&mut evidence, "source", Some("pty_screen"));
+    push_evidence(&mut evidence, "permission_kind", Some(kind));
+    push_evidence(&mut evidence, "title", title);
+    push_evidence(&mut evidence, "subject", subject);
+    push_evidence(&mut evidence, "prompt", prompt);
+    if !options.is_empty() {
+        let labels = options
+            .iter()
+            .map(|option| format!("{}:{}", option.key, option.label))
+            .collect::<Vec<_>>()
+            .join(", ");
+        push_evidence(&mut evidence, "options", Some(&labels));
+    }
+    if let Some(patterns) = extract_patterns(lines) {
+        push_evidence(&mut evidence, "patterns", Some(&patterns));
+    }
+    if let Some(buttons) = lines
+        .iter()
+        .find(|line| line.contains("Allow") && (line.contains("Reject") || line.contains("Deny")))
+    {
+        push_evidence(&mut evidence, "button_row", Some(buttons));
+    }
+    evidence
+}
+
+fn question_evidence(
+    title: Option<&str>,
+    prompt: Option<&str>,
+    custom_answer_allowed: bool,
+) -> Vec<InteractionEvidence> {
+    let mut evidence = Vec::new();
+    push_evidence(&mut evidence, "source", Some("pty_screen"));
+    push_evidence(&mut evidence, "title", title);
+    push_evidence(&mut evidence, "prompt", prompt);
+    if custom_answer_allowed {
+        push_evidence(&mut evidence, "custom_answer", Some("allowed"));
+    }
+    evidence
+}
+
+fn extract_patterns(lines: &[String]) -> Option<String> {
+    let patterns = lines
+        .iter()
+        .filter_map(|line| line.strip_prefix("- ").map(str::trim))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if patterns.is_empty() {
+        None
+    } else {
+        Some(patterns.join(", "))
+    }
+}
+
+fn submit_opencode_interaction(
+    interaction: &InteractionRequest,
+    submission: &InteractionSubmission,
+) -> Result<Vec<u8>, AdapterError> {
+    if let InteractionSubmission::CustomAnswer { answer } = submission {
+        return if interaction.kind == "question" && interaction.custom_answer_allowed {
+            Ok(format!("{answer}\r").into_bytes())
+        } else {
+            Err(AdapterError::BadRequest(
+                "custom answer is not allowed for this interaction".to_string(),
+            ))
+        };
+    }
+
+    let option_key = submission.option_key().ok_or_else(|| {
+        AdapterError::BadRequest("interaction option_key is required".to_string())
+    })?;
+    let option = interaction
+        .options
+        .iter()
+        .find(|option| option.key == option_key || option.action.as_deref() == Some(option_key))
+        .ok_or_else(|| {
+            AdapterError::BadRequest(format!("unknown interaction option {option_key}"))
+        })?;
+
+    match interaction.kind.as_str() {
+        "permission" | "external_directory" | "doom_loop" => match option.action.as_deref() {
+            Some("allow_once") => Ok(b"\r".to_vec()),
+            Some("allow_persist") => Ok(b"\t\r".to_vec()),
+            Some("deny") => Ok(b"\x1b".to_vec()),
+            _ => Err(AdapterError::BadRequest(format!(
+                "unsupported permission action for option {option_key}"
+            ))),
+        },
+        "question" => {
+            if option.key.is_empty() {
+                Err(AdapterError::BadRequest(
+                    "question option key must not be empty".to_string(),
+                ))
+            } else {
+                Ok(format!("{}\r", option.key).into_bytes())
+            }
+        }
+        other => Err(AdapterError::UnsupportedAction(format!(
+            "opencode interaction kind {other} is not supported"
+        ))),
+    }
+}
+
+fn parse_question_request(plain: &str) -> Option<InteractionRequest> {
+    let lower = plain.to_ascii_lowercase();
+    if looks_like_permission_prompt(&lower) || looks_like_model_picker(&lower) {
+        return None;
+    }
+
+    let lines = clean_lines(plain);
+    if lines.is_empty() {
+        return None;
+    }
+
+    let options = parse_options(&lines);
+    if options.is_empty() {
+        return None;
+    }
+
+    let prompt = find_question(&lines).or_else(|| find_question_prompt_before_options(&lines));
+    let has_question_context = lower.contains("question")
+        || lower.contains("custom answer")
+        || lower.contains("type a custom")
+        || lower.contains("select an option")
+        || lower.contains("submit all")
+        || lower.contains("answer");
+
+    if prompt.is_none() || !has_question_context {
+        return None;
+    }
+
+    let title = find_question_title(&lines, prompt.as_deref());
+    let custom_answer_allowed = lower.contains("custom answer") || lower.contains("type a custom");
+    Some(with_stable_id(InteractionRequest {
+        id: String::new(),
+        kind: "question".to_string(),
+        source: "opencode".to_string(),
+        title: title.clone(),
+        subject: None,
+        prompt: prompt.clone(),
+        options: options
+            .into_iter()
+            .map(|option| InteractionOption {
+                key: option.key,
+                label: option.label,
+                selected: option.selected,
+                action: None,
+            })
+            .collect(),
+        custom_answer_allowed,
+        confidence: 90,
+        evidence: question_evidence(title.as_deref(), prompt.as_deref(), custom_answer_allowed),
+        raw: relevant_raw_block(&lines),
+    }))
+}
+
+fn clean_lines(plain: &str) -> Vec<String> {
+    plain
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn parse_options(lines: &[String]) -> Vec<ParsedOption> {
+    lines
+        .iter()
+        .flat_map(|line| parse_option_lines(line))
+        .collect()
+}
+
+fn parse_option_line(line: &str) -> Option<ParsedOption> {
+    parse_option_lines(line).into_iter().next()
+}
+
+fn parse_option_lines(line: &str) -> Vec<ParsedOption> {
+    let (selected, rest) = strip_selection_marker(line.trim());
+    if let Some((key, label)) = parse_numbered_label(rest) {
+        let decision = classify_decision(&label);
+        return vec![ParsedOption {
+            key,
+            label,
+            selected,
+            decision,
+        }];
+    }
+
+    parse_button_options(rest, selected)
+}
+
+fn parse_button_options(line: &str, has_selection_marker: bool) -> Vec<ParsedOption> {
+    let lower = line.to_ascii_lowercase();
+    let mut options = Vec::new();
+
+    for (phrase, key, label, decision) in [
+        ("allow once", "allow_once", "Allow once", "allow_once"),
+        (
+            "allow always",
+            "allow_persist",
+            "Allow always",
+            "allow_persist",
+        ),
+        ("reject", "deny", "Reject", "deny"),
+        ("deny", "deny", "Deny", "deny"),
+    ] {
+        if lower.contains(phrase)
+            && !options
+                .iter()
+                .any(|option: &ParsedOption| option.key == key)
+        {
+            options.push(ParsedOption {
+                key: key.to_string(),
+                label: label.to_string(),
+                selected: has_selection_marker && options.is_empty(),
+                decision: decision.to_string(),
+            });
+        }
+    }
+
+    if lower.contains("allow always")
+        && lower.contains("reject")
+        && !options.iter().any(|option| option.key == "allow_once")
+    {
+        options.insert(
+            0,
+            ParsedOption {
+                key: "allow_once".to_string(),
+                label: "Allow once".to_string(),
+                selected: has_selection_marker,
+                decision: "allow_once".to_string(),
+            },
+        );
+    }
+
+    options
+}
+
+fn strip_selection_marker(line: &str) -> (bool, &str) {
+    let trimmed = line.trim_start();
+    for marker in ["❯", ">", "›", "▸", "•", "*"] {
+        if let Some(rest) = trimmed.strip_prefix(marker) {
+            return (true, rest.trim_start());
+        }
+    }
+    (false, trimmed)
+}
+
+fn parse_numbered_label(line: &str) -> Option<(String, String)> {
+    let (key, label) = line.split_once(". ")?;
+    let key = key.trim();
+    let label = label.trim();
+    if key.is_empty()
+        || label.is_empty()
+        || key.len() > 3
+        || !key.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((key.to_string(), label.to_string()))
+}
+
+fn classify_decision(label: &str) -> String {
+    let lower = label.to_ascii_lowercase();
+    if lower == "no"
+        || lower.starts_with("no,")
+        || lower.contains("deny")
+        || lower.contains("reject")
+        || lower.contains("cancel")
+    {
+        return "deny".to_string();
+    }
+
+    if lower.contains("always allow")
+        || lower.contains("allow access")
+        || lower.contains("remember")
+        || lower.contains("for this project")
+        || lower.contains("for this session")
+    {
+        return "allow_persist".to_string();
+    }
+
+    if lower == "yes"
+        || lower.starts_with("yes,")
+        || lower.contains("allow")
+        || lower.contains("approve")
+    {
+        return "allow_once".to_string();
+    }
+
+    "unknown".to_string()
+}
+
+fn find_question(lines: &[String]) -> Option<String> {
+    lines.iter().rev().find(|line| line.ends_with('?')).cloned()
+}
+
+fn find_question_prompt_before_options(lines: &[String]) -> Option<String> {
+    lines
+        .iter()
+        .rev()
+        .skip_while(|line| parse_option_line(line).is_some() || is_hint_line(line))
+        .find(|line| {
+            let lower = line.to_ascii_lowercase();
+            parse_option_line(line).is_none()
+                && !is_hint_line(line)
+                && !lower.contains("question")
+                && line.len() > 8
+        })
+        .cloned()
+}
+
+fn find_question_title(lines: &[String], prompt: Option<&str>) -> Option<String> {
+    lines.iter().find_map(|line| {
+        if Some(line.as_str()) == prompt || parse_option_line(line).is_some() {
+            return None;
+        }
+
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("question") || lower.contains("clarification") {
+            Some(line.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn find_title(lines: &[String]) -> Option<String> {
+    lines.iter().find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        let is_title = lower.contains("permission")
+            || lower.contains("approval")
+            || lower.contains("tool")
+            || lower.contains("command")
+            || lower.contains("bash");
+        if is_title && !line.ends_with('?') && parse_option_line(line).is_none() {
+            Some(line.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn find_subject(lines: &[String], title: Option<&str>, question: Option<&str>) -> Option<String> {
+    lines.iter().find_map(|line| {
+        if Some(line.as_str()) == title || Some(line.as_str()) == question {
+            return None;
+        }
+        if parse_option_line(line).is_some() || is_hint_line(line) {
+            return None;
+        }
+
+        let lower = normalized_line_for_matching(line);
+        let looks_subject = lower.starts_with("command:")
+            || lower.starts_with("tool:")
+            || lower.starts_with("access external directory")
+            || lower.starts_with("access external file")
+            || lower.starts_with("access outside")
+            || lower.starts_with("bash(")
+            || lower.starts_with("edit(")
+            || lower.starts_with("write(")
+            || lower.starts_with("rm ")
+            || lower.starts_with("rm\t")
+            || lower.starts_with("rm -")
+            || lower.starts_with("git ")
+            || lower.starts_with("python ")
+            || lower.starts_with("python3 ")
+            || lower.starts_with("npm ")
+            || lower.starts_with("cargo ");
+
+        if looks_subject {
+            Some(line.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn normalized_line_for_matching(line: &str) -> String {
+    line.trim_start_matches(|ch: char| !ch.is_alphanumeric() && ch != '/' && ch != '~' && ch != '.')
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn is_hint_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("esc to")
+        || lower.contains("tab to")
+        || lower.contains("ctrl+")
+        || lower.contains("enter to")
+}
+
+fn relevant_raw_block(lines: &[String]) -> String {
+    let start = lines.len().saturating_sub(24);
+    lines[start..].join("\n")
 }
 
 fn looks_like_model_picker(lower: &str) -> bool {
@@ -186,6 +788,7 @@ fn build_observation(
     ui_mode: UiMode,
     blocking_reason: Option<&str>,
     metadata: &RuntimeMetadata,
+    interaction_request: Option<InteractionRequest>,
 ) -> AdapterObservation {
     let interactive_kind = blocking_reason.map(str::to_string);
     AdapterObservation {
@@ -200,6 +803,7 @@ fn build_observation(
         current_context_usage_percent: metadata.current_context_usage_percent,
         need_interactive: interactive_kind.is_some(),
         interactive_kind,
+        interaction_request,
     }
 }
 
@@ -229,7 +833,7 @@ fn parse_runtime_footer(line: &str) -> Option<RuntimeMetadata> {
 
     let trimmed = line
         .trim()
-        .trim_start_matches(|ch: char| matches!(ch, '┃' | '│' | '┆' | '┇' | '┊' | '┋' | '¦' | '|'))
+        .trim_start_matches(['┃', '│', '┆', '┇', '┊', '┋', '¦', '|'])
         .trim();
     let parts: Vec<&str> = trimmed
         .split('·')
@@ -592,9 +1196,236 @@ mod tests {
     #[test]
     fn permission_actions_require_visible_prompt() {
         let error = OpencodeAdapter.approve_permission(b"ready").unwrap_err();
+
         assert_eq!(
             error,
             AdapterError::UiNotDetected(PERMISSION_PROMPT_NOT_VISIBLE.to_string())
+        );
+    }
+
+    #[test]
+    fn parses_structured_permission_options() {
+        let screen = r#"
+Permission request
+
+Command: rm -rf ./safe-delete-target
+Do you want to proceed?
+❯ 1. Yes
+  2. Yes, and always allow access to safe-delete-target/ from this project
+  3. No
+
+Esc to cancel · Tab to amend
+"#;
+
+        let observation = OpencodeAdapter.observe(screen.as_bytes());
+        let interaction = observation
+            .interaction_request
+            .expect("interaction request");
+
+        assert_eq!(observation.status, InstanceStatus::Blocked);
+        assert!(interaction.id.starts_with("opencode-permission-"));
+        assert_eq!(interaction.kind, "permission");
+        assert_eq!(interaction.source, "opencode");
+        assert_eq!(interaction.confidence, 95);
+        assert!(
+            interaction
+                .evidence
+                .iter()
+                .any(|item| item.label == "options")
+        );
+        assert_eq!(
+            interaction.prompt.as_deref(),
+            Some("Do you want to proceed?")
+        );
+        assert_eq!(interaction.options[0].action.as_deref(), Some("allow_once"));
+        assert_eq!(interaction.title.as_deref(), Some("Permission request"));
+        assert_eq!(
+            interaction.subject.as_deref(),
+            Some("Command: rm -rf ./safe-delete-target")
+        );
+        assert_eq!(interaction.options.len(), 3);
+        assert_eq!(interaction.options[0].key, "1");
+        assert_eq!(interaction.options[0].label, "Yes");
+        assert!(interaction.options[0].selected);
+        assert_eq!(
+            interaction.options[1].action.as_deref(),
+            Some("allow_persist")
+        );
+        assert_eq!(interaction.options[2].action.as_deref(), Some("deny"));
+    }
+
+    #[test]
+    fn parses_external_directory_permission_buttons() {
+        let screen = r#"
+Permission required
+← Access external directory ~/.config/opencode
+
+Patterns
+
+- /Users/doublemice/.config/opencode/*
+
+Allow once   Allow always   Reject
+"#;
+
+        let observation = OpencodeAdapter.observe(screen.as_bytes());
+        let interaction = observation
+            .interaction_request
+            .expect("interaction request");
+
+        assert_eq!(observation.status, InstanceStatus::Blocked);
+        assert_eq!(observation.ui_mode, UiMode::PermissionPrompt);
+        assert_eq!(observation.blocking_reason.as_deref(), Some("permission"));
+        assert!(interaction.id.starts_with("opencode-external_directory-"));
+        assert_eq!(interaction.kind, "external_directory");
+        assert_eq!(interaction.confidence, 95);
+        assert!(interaction.evidence.iter().any(|item| {
+            item.label == "patterns" && item.value.contains("/Users/doublemice/.config/opencode/*")
+        }));
+        assert_eq!(
+            interaction.subject.as_deref(),
+            Some("← Access external directory ~/.config/opencode")
+        );
+        assert_eq!(interaction.options.len(), 3);
+        assert_eq!(interaction.options[0].action.as_deref(), Some("allow_once"));
+        assert_eq!(
+            interaction.options[1].action.as_deref(),
+            Some("allow_persist")
+        );
+        assert_eq!(interaction.options[2].action.as_deref(), Some("deny"));
+        assert_eq!(
+            OpencodeAdapter
+                .submit_interaction(
+                    &interaction,
+                    &InteractionSubmission::Option {
+                        key: "allow_once".to_string()
+                    }
+                )
+                .unwrap(),
+            b"\r"
+        );
+        assert_eq!(
+            OpencodeAdapter
+                .submit_interaction(
+                    &interaction,
+                    &InteractionSubmission::Option {
+                        key: "allow_persist".to_string()
+                    }
+                )
+                .unwrap(),
+            b"\t\r"
+        );
+        assert_eq!(
+            OpencodeAdapter
+                .submit_interaction(
+                    &interaction,
+                    &InteractionSubmission::Option {
+                        key: "deny".to_string()
+                    }
+                )
+                .unwrap(),
+            b"\x1b"
+        );
+    }
+
+    #[test]
+    fn synthesizes_allow_once_for_corrupted_button_row() {
+        let screen = r#"
+Permission required
+
+┃  agents copy   Allow always   Reject
+"#;
+
+        let observation = OpencodeAdapter.observe(screen.as_bytes());
+        let interaction = observation
+            .interaction_request
+            .expect("interaction request");
+
+        assert_eq!(observation.status, InstanceStatus::Blocked);
+        assert_eq!(interaction.kind, "permission");
+        assert_eq!(interaction.options.len(), 3);
+        assert_eq!(interaction.options[0].label, "Allow once");
+        assert_eq!(interaction.options[0].action.as_deref(), Some("allow_once"));
+        assert_eq!(
+            interaction.options[1].action.as_deref(),
+            Some("allow_persist")
+        );
+        assert_eq!(interaction.options[2].action.as_deref(), Some("deny"));
+    }
+
+    #[test]
+    fn ignores_non_permission_numbered_menus() {
+        let screen = r#"
+Select model
+❯ 1. anthropic/claude
+  2. openai/gpt
+  3. local/qwen
+"#;
+
+        let observation = OpencodeAdapter.observe(screen.as_bytes());
+        assert_ne!(observation.ui_mode, UiMode::PermissionPrompt);
+        assert!(observation.interaction_request.is_none());
+    }
+
+    #[test]
+    fn parses_question_tool_interaction() {
+        let screen = r#"
+Question
+
+Which implementation path should I take?
+❯ 1. Small focused patch
+  2. Broader refactor
+
+Type a custom answer or select an option
+"#;
+
+        let observation = OpencodeAdapter.observe(screen.as_bytes());
+        let interaction = observation
+            .interaction_request
+            .expect("interaction request");
+
+        assert_eq!(observation.status, InstanceStatus::Blocked);
+        assert_eq!(observation.ui_mode, UiMode::QuestionPrompt);
+        assert_eq!(observation.blocking_reason.as_deref(), Some("question"));
+        assert_eq!(interaction.kind, "question");
+        assert!(interaction.id.starts_with("opencode-question-"));
+        assert_eq!(interaction.confidence, 90);
+        assert!(
+            interaction
+                .evidence
+                .iter()
+                .any(|item| { item.label == "custom_answer" && item.value == "allowed" })
+        );
+        assert_eq!(interaction.title.as_deref(), Some("Question"));
+        assert_eq!(
+            interaction.prompt.as_deref(),
+            Some("Which implementation path should I take?")
+        );
+        assert!(interaction.custom_answer_allowed);
+        assert_eq!(interaction.options.len(), 2);
+        assert_eq!(interaction.options[0].key, "1");
+        assert!(interaction.options[0].selected);
+        assert_eq!(interaction.options[0].action, None);
+        assert_eq!(
+            OpencodeAdapter
+                .submit_interaction(
+                    &interaction,
+                    &InteractionSubmission::Option {
+                        key: "2".to_string()
+                    }
+                )
+                .unwrap(),
+            b"2\r"
+        );
+        assert_eq!(
+            OpencodeAdapter
+                .submit_interaction(
+                    &interaction,
+                    &InteractionSubmission::CustomAnswer {
+                        answer: "Use the smaller patch".to_string()
+                    }
+                )
+                .unwrap(),
+            b"Use the smaller patch\r"
         );
     }
 

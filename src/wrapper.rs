@@ -10,6 +10,8 @@ use signal_hook::consts::signal::SIGWINCH;
 use signal_hook::iterator::Signals;
 use std::env;
 use std::io::{self, IsTerminal, Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,10 +31,8 @@ pub fn run(mut args: Vec<String>, addr: &str) -> Result<u8> {
     let client = ensure_daemon(addr)?;
     maybe_warn_about_tmux_focus_events();
 
-    let cwd = env::current_dir()
-        .context("failed to read current directory")?
-        .display()
-        .to_string();
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let cwd_display = cwd.display().to_string();
     let instance_id = format!(
         "{}-{}-{}",
         sanitize_id_part(&agent_kind),
@@ -49,10 +49,9 @@ pub fn run(mut args: Vec<String>, addr: &str) -> Result<u8> {
         &instance_id,
         &agent_kind,
         child_pty.pid,
-        &cwd,
+        &cwd_display,
         &command,
-        initial_size.rows,
-        initial_size.cols,
+        initial_size,
     )?;
     let ws = client.connect_agent_ws(&instance_id)?;
 
@@ -94,13 +93,17 @@ fn ensure_daemon(addr: &str) -> Result<ControlClient> {
     }
 
     let current_exe = env::current_exe().context("failed to locate current executable")?;
-    Command::new(current_exe)
+    let mut command = Command::new(current_exe);
+    command
         .arg("daemon")
         .arg("--addr")
         .arg(addr)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
+    command
         .spawn()
         .context("failed to start background daemon")?;
 
@@ -122,8 +125,7 @@ fn register_instance(
     pid: Option<u32>,
     cwd: &str,
     command: &str,
-    rows: u16,
-    cols: u16,
+    terminal_size: PtySize,
 ) -> Result<()> {
     client
         .register_agent(&RegisterAgentRequest {
@@ -132,8 +134,8 @@ fn register_instance(
             pid,
             cwd: cwd.to_string(),
             command: command.to_string(),
-            rows,
-            cols,
+            rows: terminal_size.rows,
+            cols: terminal_size.cols,
         })
         .map(|_| ())
 }
@@ -215,8 +217,9 @@ fn spawn_resize_forwarder(
             }
 
             let (cols, rows) = size().unwrap_or((80, 24));
-            let _ = pty::resize(&pty_master, rows, cols);
-            let _ = ws.send_resize(rows, cols);
+            if pty::resize(&pty_master, rows, cols).is_ok() {
+                let _ = ws.send_resize(rows, cols);
+            }
         }
     })
 }
@@ -352,14 +355,16 @@ impl FocusModeParser {
                 continue;
             }
 
-            let incomplete_enable = FOCUS_ENABLE
-                .starts_with(remaining)
-                .then_some(remaining.len())
-                .unwrap_or(0);
-            let incomplete_disable = FOCUS_DISABLE
-                .starts_with(remaining)
-                .then_some(remaining.len())
-                .unwrap_or(0);
+            let incomplete_enable = if FOCUS_ENABLE.starts_with(remaining) {
+                remaining.len()
+            } else {
+                0
+            };
+            let incomplete_disable = if FOCUS_DISABLE.starts_with(remaining) {
+                remaining.len()
+            } else {
+                0
+            };
             if incomplete_enable > 0 || incomplete_disable > 0 {
                 break;
             }
@@ -400,14 +405,16 @@ impl FocusInputParser {
                 continue;
             }
 
-            let incomplete_in = FOCUS_IN
-                .starts_with(remaining)
-                .then_some(remaining.len())
-                .unwrap_or(0);
-            let incomplete_out = FOCUS_OUT
-                .starts_with(remaining)
-                .then_some(remaining.len())
-                .unwrap_or(0);
+            let incomplete_in = if FOCUS_IN.starts_with(remaining) {
+                remaining.len()
+            } else {
+                0
+            };
+            let incomplete_out = if FOCUS_OUT.starts_with(remaining) {
+                remaining.len()
+            } else {
+                0
+            };
             if incomplete_in > 0 || incomplete_out > 0 {
                 break;
             }

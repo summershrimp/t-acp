@@ -1,0 +1,1130 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>t-acp command observe</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f8fa;
+      --panel: #ffffff;
+      --panel-2: #f1f4f7;
+      --text: #24292f;
+      --muted: #57606a;
+      --line: #d0d7de;
+      --accent: #0969da;
+      --accent-soft: #ddf4ff;
+      --info: #8250df;
+      --warn: #9a6700;
+      --danger: #cf222e;
+      --ok: #1a7f37;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      min-height: 100vh;
+    }
+    header {
+      height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 18px;
+      border-bottom: 1px solid var(--line);
+      background: #ffffff;
+    }
+    h1 {
+      font-size: 16px;
+      margin: 0;
+      font-weight: 600;
+      color: var(--accent);
+    }
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .toolbar a {
+      color: var(--info);
+      text-decoration: none;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: 340px minmax(0, 1fr);
+      min-height: calc(100vh - 56px);
+    }
+    aside {
+      border-right: 1px solid var(--line);
+      background: #f1f4f7;
+      min-width: 0;
+    }
+    .sidebar-title {
+      height: 44px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 12px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: 0;
+    }
+    .agent-list {
+      display: grid;
+      gap: 12px;
+      padding: 12px;
+    }
+    .agent-row {
+      width: 100%;
+      display: grid;
+      gap: 6px;
+      text-align: left;
+      color: var(--text);
+      background: transparent;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 10px;
+      cursor: pointer;
+      font: inherit;
+      min-width: 0;
+    }
+    .agent-row:hover {
+      border-color: #8c959f;
+      background: #ffffff;
+    }
+    .agent-row:focus-visible,
+    .mini-action:focus-visible,
+    .action-button:focus-visible,
+    .custom-answer button:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .agent-row.selected {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+      box-shadow: inset 3px 0 0 var(--accent);
+    }
+    .agent-row.needs-input {
+      border-color: #f0883e;
+      background: #fff8f0;
+      box-shadow: inset 3px 0 0 #f97316;
+    }
+    .agent-row.needs-input.selected {
+      border-color: #f97316;
+      background: #fff4e5;
+      box-shadow: inset 3px 0 0 #f97316;
+    }
+    .agent-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+    }
+    .agent-id {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      color: var(--accent);
+    }
+    .agent-subtitle {
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+    }
+    .agent-interaction {
+      display: grid;
+      gap: 6px;
+      border: 1px solid #ffd8a8;
+      border-radius: 4px;
+      background: #ffffff;
+      padding: 7px;
+    }
+    .agent-interaction-title {
+      color: var(--danger);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .mini-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .mini-action {
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: var(--panel-2);
+      color: var(--accent);
+      cursor: pointer;
+      font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      padding: 4px 7px;
+    }
+    .mini-action:hover {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+    .mini-action.allow_once {
+      border-color: #aceebb;
+      background: #dafbe1;
+      color: var(--ok);
+    }
+    .mini-action.allow_persist {
+      border-color: #eac54f;
+      background: #fff8c5;
+      color: var(--warn);
+    }
+    .mini-action.deny {
+      border-color: #ffb4ab;
+      background: #ffebe9;
+      color: var(--danger);
+    }
+    .agent-events {
+      display: grid;
+      gap: 4px;
+      border-top: 1px dashed var(--line);
+      padding-top: 6px;
+    }
+    .agent-event {
+      display: grid;
+      grid-template-columns: 86px minmax(0, 1fr);
+      gap: 6px;
+      color: var(--muted);
+      font-size: 11px;
+      min-width: 0;
+    }
+    .agent-event-kind {
+      color: var(--info);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .agent-event-message {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .badge {
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 2px 7px;
+      font-size: 11px;
+      color: var(--muted);
+      background: var(--panel-2);
+    }
+    .badge.ready { color: var(--ok); background: #dafbe1; border-color: #aceebb; }
+    .badge.busy { color: var(--warn); background: #fff8c5; border-color: #eac54f; }
+    .badge.blocked { color: var(--danger); background: #ffebe9; border-color: #ffb4ab; }
+    .badge.exited { color: var(--muted); }
+    .content {
+      min-width: 0;
+      min-height: 0;
+      overflow: auto;
+    }
+    .panes {
+      display: grid;
+      grid-template-columns: minmax(520px, 1fr) minmax(430px, 0.62fr);
+      gap: 12px;
+      padding: 12px;
+    }
+    .side-stack {
+      display: grid;
+      gap: 12px;
+      align-content: start;
+      min-width: 0;
+    }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      min-width: 0;
+    }
+    .section-title {
+      height: 40px;
+      padding: 0 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: 0;
+    }
+    .section-status {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 7px;
+      background: var(--panel-2);
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .section-status.pending {
+      border-color: #ffd8a8;
+      background: #fff4e5;
+      color: #bc4c00;
+    }
+    .body { padding: 12px; }
+    .meta {
+      display: grid;
+      grid-template-columns: repeat(8, minmax(0, 1fr));
+      gap: 8px;
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+    }
+    .kv {
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 8px;
+      min-width: 0;
+      min-height: 52px;
+    }
+    .kv .k {
+      color: var(--muted);
+      font-size: 11px;
+      margin-bottom: 4px;
+    }
+    .kv .v {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .screen {
+      margin: 0;
+      padding: 12px;
+      height: calc(100vh - 210px);
+      min-height: 360px;
+      overflow: auto;
+      background: #ffffff;
+      color: var(--text);
+      font: 13px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre;
+      border-radius: 0 0 4px 4px;
+    }
+    .approval {
+      display: grid;
+      gap: 8px;
+    }
+    .approval-empty {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .human-card {
+      display: grid;
+      gap: 14px;
+      border: 1px solid #ffd8a8;
+      border-radius: 6px;
+      background: #fffdf7;
+      box-shadow: inset 4px 0 0 #f97316;
+      padding: 14px;
+    }
+    .human-head {
+      display: grid;
+      gap: 6px;
+    }
+    .human-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .human-kind {
+      border: 1px solid #eac54f;
+      border-radius: 999px;
+      background: #ffffff;
+      color: var(--warn);
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 8px;
+      white-space: nowrap;
+    }
+    .human-summary {
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .human-meta {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.4;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .evidence {
+      display: grid;
+      gap: 6px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: #ffffff;
+      padding: 8px;
+    }
+    .evidence-row {
+      display: grid;
+      grid-template-columns: 112px minmax(0, 1fr);
+      gap: 8px;
+      font-size: 11px;
+      line-height: 1.35;
+      min-width: 0;
+    }
+    .evidence-label {
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .evidence-value {
+      color: var(--text);
+      overflow-wrap: anywhere;
+    }
+    .action-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+    }
+    .action-button {
+      min-height: 56px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #ffffff;
+      color: var(--text);
+      cursor: pointer;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 4px 10px;
+      align-items: center;
+      padding: 10px 12px;
+      text-align: left;
+      font: 12px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .action-button:hover {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+    .action-button.allow_once {
+      border-color: #aceebb;
+      background: #dafbe1;
+    }
+    .action-button.allow_persist {
+      border-color: #eac54f;
+      background: #fff8c5;
+    }
+    .action-button.deny {
+      border-color: #ffb4ab;
+      background: #ffebe9;
+    }
+    .action-button.select {
+      border-color: #b6e3ff;
+      background: #ddf4ff;
+    }
+    .action-label {
+      font-weight: 700;
+      color: var(--text);
+      overflow-wrap: anywhere;
+    }
+    .action-command {
+      justify-self: end;
+      color: var(--muted);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+    .action-meta {
+      color: var(--muted);
+      font-size: 11px;
+      grid-column: 1 / -1;
+    }
+    .raw-details {
+      border-top: 1px dashed #eac54f;
+      padding-top: 8px;
+    }
+    .raw-details summary {
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .raw-inline {
+      max-height: 170px;
+      overflow: auto;
+      margin: 8px 0 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: var(--muted);
+      background: #ffffff;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 8px;
+    }
+    .custom-answer button {
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: #ffffff;
+      color: var(--accent);
+      cursor: pointer;
+      font: 12px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      padding: 5px 8px;
+    }
+    .custom-answer button:hover {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+    .custom-answer {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      padding-top: 2px;
+    }
+    .custom-answer input {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 6px 8px;
+      color: var(--text);
+      background: #ffffff;
+      font: 12px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .events {
+      max-height: 210px;
+      overflow: auto;
+      display: grid;
+      gap: 6px;
+    }
+    .event {
+      display: grid;
+      grid-template-columns: 54px 130px 1fr;
+      gap: 8px;
+      padding: 6px 8px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: var(--panel-2);
+      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      min-width: 0;
+    }
+    .event .kind { color: var(--info); }
+    .event div {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .raw {
+      max-height: 190px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: var(--muted);
+      background: #ffffff;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 8px;
+    }
+    .empty {
+      color: var(--muted);
+      font-size: 13px;
+      padding: 12px;
+    }
+    .diagnostic {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      min-width: 0;
+    }
+    .diagnostic summary {
+      min-height: 40px;
+      padding: 0 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+      cursor: pointer;
+      list-style: none;
+    }
+    .diagnostic summary::-webkit-details-marker { display: none; }
+    .diagnostic summary::before {
+      content: '+';
+      margin-right: 8px;
+      color: var(--accent);
+    }
+    .diagnostic[open] summary::before {
+      content: '-';
+    }
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; }
+      aside { border-right: 0; border-bottom: 1px solid var(--line); }
+      .agent-list { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+      .panes { grid-template-columns: 1fr; }
+      .meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>$ t-acp observe</h1>
+    <div class="toolbar">
+      <a id="json-link" href="/agents" target="_blank" rel="noreferrer">GET /agents</a>
+      <div id="status">loading</div>
+    </div>
+  </header>
+  <div class="layout">
+    <aside>
+      <div class="sidebar-title"><span>$ agents</span><span id="agent-count">0</span></div>
+      <div id="agent-list" class="agent-list"></div>
+    </aside>
+    <div class="content">
+      <div class="meta">
+        <div class="kv"><div class="k">id</div><div class="v" id="agent-id"></div></div>
+        <div class="kv"><div class="k">status</div><div class="v" id="agent-status"></div></div>
+        <div class="kv"><div class="k">mode</div><div class="v" id="ui-mode"></div></div>
+        <div class="kv"><div class="k">model</div><div class="v" id="current-model"></div></div>
+        <div class="kv"><div class="k">provider</div><div class="v" id="current-provider"></div></div>
+        <div class="kv"><div class="k">context</div><div class="v" id="current-context"></div></div>
+        <div class="kv"><div class="k">cursor</div><div class="v" id="cursor"></div></div>
+        <div class="kv"><div class="k">updated</div><div class="v" id="updated-at"></div></div>
+      </div>
+      <div class="panes">
+      <section>
+        <div class="section-title"><span>$ screen --vt100</span><span id="screen-size"></span></div>
+        <pre id="screen" class="screen"></pre>
+      </section>
+      <div class="side-stack">
+        <section>
+          <div class="section-title"><span>$ human-input</span><span id="interaction-status" class="section-status">clear</span></div>
+          <div class="body"><div id="approval" class="approval"></div></div>
+        </section>
+        <section>
+          <div class="section-title"><span>$ tail events</span><span id="event-count"></span></div>
+          <div class="body"><div id="events" class="events"></div></div>
+        </section>
+        <details class="diagnostic">
+          <summary><span>$ tail raw-pty</span><span>utf8 lossy</span></summary>
+          <div class="body"><div id="raw" class="raw"></div></div>
+        </details>
+      </div>
+      </div>
+    </div>
+  </div>
+  <script>
+    const INITIAL_AGENT_ID = __INITIAL_AGENT_ID__;
+    const statusEl = document.getElementById('status');
+    const agentListEl = document.getElementById('agent-list');
+    const jsonLinkEl = document.getElementById('json-link');
+    let selectedAgentId = INITIAL_AGENT_ID;
+    let lastAgents = [];
+    let observationsByAgentId = new Map();
+    const rawInteractionDetailsOpen = new Map();
+
+    function setText(id, value) {
+      document.getElementById(id).textContent = value == null ? '' : String(value);
+    }
+
+    function displayTime(value) {
+      if (!value) return '';
+      return new Date(Number(value)).toLocaleTimeString();
+    }
+
+    function compactAgentLine(agent) {
+      const parts = [
+        agent.current_agent,
+        agent.current_model,
+        agent.current_provider,
+        agent.current_context_window,
+      ].filter(Boolean);
+      return parts.length ? parts.join(' · ') : agent.command;
+    }
+
+    function interactionSummary(interaction) {
+      if (!interaction) return null;
+      const summary = interactionPrimaryText(interaction);
+      return [`[${interaction.kind}]`, summary].filter(Boolean).join(' ');
+    }
+
+    function currentInteractionForAgent(agent) {
+      const observation = observationsByAgentId.get(agent.id);
+      return observation?.agent?.interaction_request || agent.interaction_request;
+    }
+
+    function latestEventsForAgent(agent) {
+      return (observationsByAgentId.get(agent.id)?.events || []).slice(-3).reverse();
+    }
+
+    function renderMiniActions(agent, interaction) {
+      if (!interaction || !(interaction.options || []).length) return null;
+
+      const box = document.createElement('div');
+      box.className = 'mini-actions';
+      for (const option of interaction.options || []) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'mini-action ' + actionClass(option);
+        button.textContent = optionText(option);
+        button.addEventListener('click', (event) => {
+          event.stopPropagation();
+          selectedAgentId = agent.id;
+          submitInteractionOption(interaction, option, agent.id);
+        });
+        box.append(button);
+      }
+      return box;
+    }
+
+    function renderAgentInteraction(agent, interaction) {
+      if (!interaction) return null;
+
+      const box = document.createElement('div');
+      box.className = 'agent-interaction';
+      const title = document.createElement('div');
+      title.className = 'agent-interaction-title';
+      title.textContent = interactionSummary(interaction);
+      box.append(title);
+      const actions = renderMiniActions(agent, interaction);
+      if (actions) box.append(actions);
+      return box;
+    }
+
+    function agentSortKey(agent) {
+      const interaction = currentInteractionForAgent(agent);
+      if (interaction) return 0;
+      if (agent.status === 'blocked') return 1;
+      if (agent.status === 'busy') return 2;
+      if (agent.status === 'ready') return 3;
+      return 4;
+    }
+
+    function renderAgentEvents(agent) {
+      const events = latestEventsForAgent(agent);
+      if (!events.length) return null;
+
+      const box = document.createElement('div');
+      box.className = 'agent-events';
+      for (const event of events) {
+        const row = document.createElement('div');
+        row.className = 'agent-event';
+        const kind = document.createElement('div');
+        kind.className = 'agent-event-kind';
+        kind.textContent = event.kind;
+        const message = document.createElement('div');
+        message.className = 'agent-event-message';
+        message.textContent = event.message;
+        row.append(kind, message);
+        box.append(row);
+      }
+      return box;
+    }
+
+    function renderAgentList(agents) {
+      lastAgents = agents;
+      setText('agent-count', String(agents.length));
+      agentListEl.textContent = '';
+
+      if (!agents.length) {
+        selectedAgentId = null;
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = '$ agents: empty';
+        agentListEl.append(empty);
+        return;
+      }
+
+      if (!selectedAgentId || !agents.some((agent) => agent.id === selectedAgentId)) {
+        selectedAgentId = agents[0].id;
+      }
+
+      const orderedAgents = [...agents].sort((a, b) => {
+        const byPriority = agentSortKey(a) - agentSortKey(b);
+        if (byPriority !== 0) return byPriority;
+        return String(a.id).localeCompare(String(b.id));
+      });
+
+      for (const agent of orderedAgents) {
+        const pendingInteraction = currentInteractionForAgent(agent);
+        const row = document.createElement('div');
+        row.role = 'button';
+        row.tabIndex = 0;
+        row.className = agent.id === selectedAgentId ? 'agent-row selected' : 'agent-row';
+        if (pendingInteraction) row.classList.add('needs-input');
+        const selectAgent = () => {
+          selectedAgentId = agent.id;
+          renderAgentList(lastAgents);
+          refreshObservation();
+        };
+        row.addEventListener('click', selectAgent);
+        row.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter' || event.key === ' ') selectAgent();
+        });
+
+        const head = document.createElement('div');
+        head.className = 'agent-head';
+        const id = document.createElement('div');
+        id.className = 'agent-id';
+        id.textContent = '> ' + agent.id;
+        const badge = document.createElement('div');
+        badge.className = 'badge ' + agent.status;
+        badge.textContent = agent.status;
+        head.append(id, badge);
+
+        const subtitle = document.createElement('div');
+        subtitle.className = 'agent-subtitle';
+        subtitle.textContent = compactAgentLine(agent);
+
+        const cwd = document.createElement('div');
+        cwd.className = 'agent-subtitle';
+        cwd.textContent = agent.cwd;
+
+        row.append(head, subtitle, cwd);
+        const interaction = renderAgentInteraction(agent, pendingInteraction);
+        if (interaction) row.append(interaction);
+        const events = renderAgentEvents(agent);
+        if (events) row.append(events);
+        agentListEl.append(row);
+      }
+    }
+
+    function clearObservation(message) {
+      for (const id of [
+        'agent-id',
+        'agent-status',
+        'ui-mode',
+        'current-model',
+        'current-provider',
+        'current-context',
+        'cursor',
+        'updated-at',
+        'screen-size',
+      ]) {
+        setText(id, '');
+      }
+      document.getElementById('screen').textContent = message || '';
+      document.getElementById('raw').textContent = '';
+      renderInteraction(null);
+      renderEvents([]);
+      jsonLinkEl.href = '/agents';
+    }
+
+    async function postInteraction(payload, agentId = selectedAgentId) {
+      if (!agentId) return;
+      const response = await fetch(`/agents/${encodeURIComponent(agentId)}/interaction`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        let message = `interaction HTTP ${response.status}`;
+        try {
+          const body = await response.json();
+          message = body.message || body.error || message;
+        } catch (_) {}
+        throw new Error(message);
+      }
+      await refresh();
+    }
+
+    async function submitInteractionOption(interaction, option, agentId = selectedAgentId) {
+      try {
+        await postInteraction({
+          interaction_id: interaction.id,
+          option_key: option.action || option.key,
+          custom_answer: null,
+        }, agentId);
+      } catch (error) {
+        statusEl.textContent = 'error: ' + error.message;
+      }
+    }
+
+    function renderCustomAnswer(interaction) {
+      const row = document.createElement('div');
+      row.className = 'custom-answer';
+      const input = document.createElement('input');
+      input.placeholder = 'custom answer';
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = 'send';
+      const submit = () => {
+        const value = input.value.trim();
+        if (value) postInteraction({
+          interaction_id: interaction.id,
+          option_key: null,
+          custom_answer: value,
+        }).catch((error) => {
+          statusEl.textContent = 'error: ' + error.message;
+        });
+      };
+      button.addEventListener('click', submit);
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') submit();
+      });
+      row.append(input, button);
+      return row;
+    }
+
+    function actionClass(option) {
+      return option.action || 'select';
+    }
+
+    function optionText(option) {
+      return option.label || option.key || option.action || 'option';
+    }
+
+    function actionCommand(option) {
+      if (option.action === 'allow_once') return '$ approve --once';
+      if (option.action === 'allow_persist') return '$ approve --always';
+      if (option.action === 'deny') return '$ reject';
+      return option.key ? `$ send ${option.key}` : '$ send';
+    }
+
+    function actionHint(interaction, option) {
+      if (option.action === 'allow_once') return 'Approve this request only.';
+      if (option.action === 'allow_persist') return 'Approve and keep this permission.';
+      if (option.action === 'deny') return 'Return rejection to the agent.';
+      if (interaction.kind === 'question') return 'Select this answer.';
+      return option.action || option.key || 'Send to terminal.';
+    }
+
+    function interactionPrimaryText(interaction) {
+      return (
+        interaction.prompt ||
+        interaction.subject ||
+        interaction.title ||
+        `${interaction.kind} interaction`
+      );
+    }
+
+    function interactionSecondaryText(interaction) {
+      return [
+        interaction.source,
+        interaction.confidence == null ? null : `confidence ${interaction.confidence}%`,
+        interaction.subject && interaction.subject !== interactionPrimaryText(interaction) ? interaction.subject : null,
+        interaction.title && interaction.title !== interactionPrimaryText(interaction) ? interaction.title : null,
+      ].filter(Boolean).join(' | ');
+    }
+
+    function renderEvidence(interaction) {
+      const evidence = (interaction.evidence || []).slice(0, 5);
+      if (!evidence.length) return null;
+
+      const box = document.createElement('div');
+      box.className = 'evidence';
+      for (const item of evidence) {
+        const row = document.createElement('div');
+        row.className = 'evidence-row';
+        const label = document.createElement('div');
+        label.className = 'evidence-label';
+        label.textContent = item.label;
+        const value = document.createElement('div');
+        value.className = 'evidence-value';
+        value.textContent = item.value;
+        row.append(label, value);
+        box.append(row);
+      }
+      return box;
+    }
+
+    function renderActionButton(interaction, option, agentId = selectedAgentId) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'action-button ' + actionClass(option);
+      const label = document.createElement('span');
+      label.className = 'action-label';
+      label.textContent = optionText(option);
+      const command = document.createElement('span');
+      command.className = 'action-command';
+      command.textContent = actionCommand(option);
+      const meta = document.createElement('span');
+      meta.className = 'action-meta';
+      meta.textContent = actionHint(interaction, option);
+      button.append(label, command, meta);
+      button.addEventListener('click', () => submitInteractionOption(interaction, option, agentId));
+      return button;
+    }
+
+    function rawInteractionDetailsKey(interaction) {
+      return `${selectedAgentId || 'agent'}:${interaction.id || interaction.kind || 'unknown'}`;
+    }
+
+    function renderInteraction(interaction) {
+      const root = document.getElementById('approval');
+      const status = document.getElementById('interaction-status');
+      root.textContent = '';
+      if (!interaction) {
+        status.textContent = 'clear';
+        status.className = 'section-status';
+        const empty = document.createElement('div');
+        empty.className = 'approval-empty';
+        empty.textContent = '$ human-input: clear';
+        root.append(empty);
+        return;
+      }
+      status.textContent = interaction.confidence == null ? 'pending' : `pending ${interaction.confidence}%`;
+      status.className = 'section-status pending';
+
+      const card = document.createElement('div');
+      card.className = 'human-card';
+
+      const head = document.createElement('div');
+      head.className = 'human-head';
+      const title = document.createElement('div');
+      title.className = 'human-title';
+      const titleText = document.createElement('span');
+      titleText.textContent = 'Human input required';
+      const kind = document.createElement('span');
+      kind.className = 'human-kind';
+      kind.textContent = interaction.kind;
+      title.append(titleText, kind);
+
+      const summary = document.createElement('div');
+      summary.className = 'human-summary';
+      summary.textContent = interactionPrimaryText(interaction);
+      const meta = document.createElement('div');
+      meta.className = 'human-meta';
+      meta.textContent = interactionSecondaryText(interaction);
+      head.append(title, summary);
+      if (meta.textContent) head.append(meta);
+      card.append(head);
+
+      const evidence = renderEvidence(interaction);
+      if (evidence) card.append(evidence);
+
+      const actions = document.createElement('div');
+      actions.className = 'action-grid';
+      for (const option of interaction.options || []) {
+        actions.append(renderActionButton(interaction, option));
+      }
+      if (actions.childElementCount) card.append(actions);
+
+      if (interaction.custom_answer_allowed) {
+        card.append(renderCustomAnswer(interaction));
+      }
+
+      if (interaction.raw) {
+        const details = document.createElement('details');
+        details.className = 'raw-details';
+        const rawDetailsKey = rawInteractionDetailsKey(interaction);
+        details.open = rawInteractionDetailsOpen.get(rawDetailsKey) === true;
+        details.addEventListener('toggle', () => {
+          rawInteractionDetailsOpen.set(rawDetailsKey, details.open);
+        });
+        const detailsTitle = document.createElement('summary');
+        detailsTitle.textContent = 'raw interaction screen';
+        const raw = document.createElement('pre');
+        raw.className = 'raw-inline';
+        raw.textContent = interaction.raw;
+        details.append(detailsTitle, raw);
+        card.append(details);
+      }
+
+      root.append(card);
+    }
+
+    function renderEvents(events) {
+      const root = document.getElementById('events');
+      setText('event-count', String((events || []).length));
+      root.textContent = '';
+      if (!(events || []).length) {
+        const empty = document.createElement('div');
+        empty.className = 'approval-empty';
+        empty.textContent = '$ events: empty';
+        root.append(empty);
+        return;
+      }
+      for (const event of [...(events || [])].reverse()) {
+        const row = document.createElement('div');
+        row.className = 'event';
+        const seq = document.createElement('div');
+        seq.textContent = '#' + event.seq;
+        const kind = document.createElement('div');
+        kind.className = 'kind';
+        kind.textContent = event.kind;
+        const msg = document.createElement('div');
+        msg.textContent = event.message;
+        row.append(seq, kind, msg);
+        root.append(row);
+      }
+    }
+
+    async function refreshAgents() {
+      const response = await fetch('/agents', { cache: 'no-store' });
+      if (!response.ok) throw new Error(`agents HTTP ${response.status}`);
+      const data = await response.json();
+      const agents = data.agents || [];
+      const observationResults = await Promise.allSettled(
+        agents.map((agent) =>
+          fetch(`/agents/${encodeURIComponent(agent.id)}/observations`, { cache: 'no-store' })
+            .then((response) => {
+              if (!response.ok) throw new Error(`observations ${agent.id} HTTP ${response.status}`);
+              return response.json();
+            })
+            .then((observation) => [agent.id, observation])
+        )
+      );
+      observationsByAgentId = new Map(
+        observationResults
+          .filter((result) => result.status === 'fulfilled')
+          .map((result) => result.value)
+      );
+      renderAgentList(agents);
+    }
+
+    async function refreshObservation() {
+      if (!selectedAgentId) {
+        clearObservation('No agent selected.');
+        return;
+      }
+
+      const response = await fetch(`/agents/${encodeURIComponent(selectedAgentId)}/observations`, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`observations HTTP ${response.status}`);
+      const data = await response.json();
+      setText('agent-id', data.agent.id);
+      setText('agent-status', data.agent.status);
+      setText('ui-mode', data.agent.ui_mode);
+      setText('current-model', data.agent.current_model);
+      setText('current-provider', data.agent.current_provider);
+      setText(
+        'current-context',
+        [data.agent.current_context_window, data.agent.current_context_usage_percent == null ? null : `${data.agent.current_context_usage_percent}%`]
+          .filter(Boolean)
+          .join(' ')
+      );
+      setText('cursor', `${data.screen.cursor.row},${data.screen.cursor.col}`);
+      setText('updated-at', displayTime(data.agent.updated_at_ms));
+      setText('screen-size', `${data.screen.rows}x${data.screen.cols}`);
+      document.getElementById('screen').textContent = data.screen.text || '';
+      document.getElementById('raw').textContent = data.raw_tail_utf8_lossy || '';
+      renderInteraction(data.agent.interaction_request);
+      renderEvents(data.events);
+      jsonLinkEl.href = `/agents/${encodeURIComponent(data.agent.id)}/observations`;
+    }
+
+    async function refresh() {
+      try {
+        await refreshAgents();
+        await refreshObservation();
+        statusEl.textContent = 'watch --interval=1s';
+      } catch (error) {
+        statusEl.textContent = 'error: ' + error.message;
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 1000);
+  </script>
+</body>
+</html>
